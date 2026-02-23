@@ -89,8 +89,7 @@ impl SigmaLanguageServer {
 
         // Abort any existing pending task, then spawn the new one while holding
         // the lock so no concurrent call can slip in between.
-        let mut guard: tokio::sync::MutexGuard<'_, _> =
-            self.pending_diagnostics.lock().await;
+        let mut guard: tokio::sync::MutexGuard<'_, _> = self.pending_diagnostics.lock().await;
         if let Some(handle) = guard.remove(&uri) {
             handle.abort();
         }
@@ -218,8 +217,7 @@ impl LanguageServer for SigmaLanguageServer {
 
         // Cancel any pending diagnostics for this file.
         {
-            let mut pending: tokio::sync::MutexGuard<'_, _> =
-                self.pending_diagnostics.lock().await;
+            let mut pending: tokio::sync::MutexGuard<'_, _> = self.pending_diagnostics.lock().await;
             if let Some(handle) = pending.remove(&uri) {
                 handle.abort();
             }
