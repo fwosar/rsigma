@@ -3053,9 +3053,9 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "yamlpatch"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bb7c065a6ba71e449f322c04ef6c28ad0df0bbf2b8fba45c3fccd0a7e21a5c1"
+checksum = "161da658a316f0c1cd94875d49e4a63eaa25f7a2acf28d0a2429b78a0b8d845a"
 dependencies = [
  "indexmap",
  "line-index",
@@ -3069,9 +3069,9 @@ dependencies = [
 
 [[package]]
 name = "yamlpath"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba44b790009d79fab5ed0c4466bfe14ae42897f8726ed1e94211072e540c2579"
+checksum = "b73483c026a544d0172d0f3435e929bd054230f97ad0c4a9afc610a8cef1358b"
 dependencies = [
  "line-index",
  "self_cell",
