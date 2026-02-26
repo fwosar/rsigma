@@ -213,10 +213,61 @@ const COMPRESSION_LEVEL: Compression = Compression::fast();
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct EventBuffer {
     /// (timestamp, deflate-compressed event JSON) pairs, ordered by timestamp.
+    #[serde(with = "event_buffer_serde")]
     entries: VecDeque<(i64, Vec<u8>)>,
     /// Maximum number of events to retain. When exceeded, the oldest event is
     /// evicted regardless of the time window.
     max_events: usize,
+}
+
+/// Custom serde for EventBuffer entries: encodes compressed bytes as base64
+/// instead of JSON number arrays, cutting snapshot size ~3x.
+mod event_buffer_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::VecDeque;
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        ts: i64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    }
+
+    mod base64_bytes {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&STANDARD.encode(bytes))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+            let s: String = serde::Deserialize::deserialize(d)?;
+            STANDARD.decode(s).map_err(serde::de::Error::custom)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(
+        entries: &VecDeque<(i64, Vec<u8>)>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let v: Vec<Entry> = entries
+            .iter()
+            .map(|(ts, data)| Entry {
+                ts: *ts,
+                data: data.clone(),
+            })
+            .collect();
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<VecDeque<(i64, Vec<u8>)>, D::Error> {
+        let v: Vec<Entry> = Vec::deserialize(d)?;
+        Ok(v.into_iter().map(|e| (e.ts, e.data)).collect())
+    }
 }
 
 impl EventBuffer {
