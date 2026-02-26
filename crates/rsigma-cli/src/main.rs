@@ -172,7 +172,7 @@ enum Commands {
 
         /// Interval in seconds between periodic state snapshots (default: 30).
         /// Only meaningful when --state-db is set.
-        #[arg(long = "state-save-interval", default_value = "30")]
+        #[arg(long = "state-save-interval", default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
         state_save_interval: u64,
     },
 
