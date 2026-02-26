@@ -132,7 +132,7 @@ impl CompiledCondition {
 ///
 /// Each element corresponds to a `GroupByField` value extracted from an event.
 /// `None` means the field was absent from the event.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct GroupKey(pub Vec<Option<String>>);
 
 impl GroupKey {
@@ -210,13 +210,64 @@ const COMPRESSION_LEVEL: Compression = Compression::fast();
 ///
 /// The buffer enforces a hard cap (`max_events`) so memory is bounded at:
 ///   `max_events × (avg_compressed_size + 24)` bytes per group key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct EventBuffer {
     /// (timestamp, deflate-compressed event JSON) pairs, ordered by timestamp.
+    #[serde(with = "event_buffer_serde")]
     entries: VecDeque<(i64, Vec<u8>)>,
     /// Maximum number of events to retain. When exceeded, the oldest event is
     /// evicted regardless of the time window.
     max_events: usize,
+}
+
+/// Custom serde for EventBuffer entries: encodes compressed bytes as base64
+/// instead of JSON number arrays, cutting snapshot size ~3x.
+mod event_buffer_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::VecDeque;
+
+    #[derive(Serialize, Deserialize)]
+    struct Entry {
+        ts: i64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    }
+
+    mod base64_bytes {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&STANDARD.encode(bytes))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+            let s: String = serde::Deserialize::deserialize(d)?;
+            STANDARD.decode(s).map_err(serde::de::Error::custom)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(
+        entries: &VecDeque<(i64, Vec<u8>)>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let v: Vec<Entry> = entries
+            .iter()
+            .map(|(ts, data)| Entry {
+                ts: *ts,
+                data: data.clone(),
+            })
+            .collect();
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<VecDeque<(i64, Vec<u8>)>, D::Error> {
+        let v: Vec<Entry> = Vec::deserialize(d)?;
+        Ok(v.into_iter().map(|e| (e.ts, e.data)).collect())
+    }
 }
 
 impl EventBuffer {
@@ -301,7 +352,7 @@ fn decompress_event(compressed: &[u8]) -> Option<serde_json::Value> {
 /// Each ref costs ~40 bytes (vs. 100–1000+ bytes for compressed events),
 /// making this mode suitable for high-volume correlations where only
 /// traceability is needed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct EventRef {
     /// Event timestamp (epoch seconds).
     pub timestamp: i64,
@@ -314,7 +365,7 @@ pub struct EventRef {
 ///
 /// Stores only timestamps and optional event IDs — no event payload,
 /// no compression. This is the minimal-memory alternative to `EventBuffer`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct EventRefBuffer {
     /// Event references, ordered by timestamp.
     entries: VecDeque<EventRef>,
@@ -393,7 +444,7 @@ fn extract_event_id(event: &serde_json::Value) -> Option<String> {
 /// Per-group mutable state within a time window.
 ///
 /// Each variant matches the type of aggregation being performed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub enum WindowState {
     /// For `event_count`: timestamps of matching events.
     EventCount { timestamps: VecDeque<i64> },
