@@ -1156,6 +1156,7 @@ impl CorrelationEngine {
         }
 
         CorrelationSnapshot {
+            version: SNAPSHOT_VERSION,
             windows,
             last_alert,
             event_buffers,
@@ -1166,7 +1167,13 @@ impl CorrelationEngine {
     /// Import previously exported state, mapping stable identifiers back to
     /// current correlation indices. Entries whose identifiers no longer match
     /// any loaded correlation are silently dropped.
-    pub fn import_state(&mut self, snapshot: CorrelationSnapshot) {
+    ///
+    /// Returns `false` (and imports nothing) if the snapshot version is
+    /// incompatible with the current schema.
+    pub fn import_state(&mut self, snapshot: CorrelationSnapshot) -> bool {
+        if snapshot.version != SNAPSHOT_VERSION {
+            return false;
+        }
         let id_to_idx = self.build_id_to_index_map();
 
         for (corr_id, groups) in snapshot.windows {
@@ -1200,6 +1207,8 @@ impl CorrelationEngine {
                 }
             }
         }
+
+        true
     }
 
     /// Stable identifier for a correlation rule: prefers id, then name, then title.
@@ -1221,6 +1230,9 @@ impl CorrelationEngine {
     }
 }
 
+/// Current snapshot schema version. Bump when the serialized format changes.
+const SNAPSHOT_VERSION: u32 = 1;
+
 /// Serializable snapshot of all mutable correlation state.
 ///
 /// Uses stable string identifiers (correlation id/name/title) as keys so the
@@ -1229,6 +1241,9 @@ impl CorrelationEngine {
 /// `GroupKey` cannot be used as a JSON object key.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct CorrelationSnapshot {
+    /// Schema version — used to detect incompatible snapshots on load.
+    #[serde(default = "default_snapshot_version")]
+    pub version: u32,
     /// Per-correlation, per-group window state.
     pub windows: HashMap<String, Vec<(GroupKey, WindowState)>>,
     /// Per-correlation, per-group last alert timestamp (for suppression).
@@ -1237,6 +1252,10 @@ pub struct CorrelationSnapshot {
     pub event_buffers: HashMap<String, Vec<(GroupKey, EventBuffer)>>,
     /// Per-correlation, per-group event reference buffers.
     pub event_ref_buffers: HashMap<String, Vec<(GroupKey, EventRefBuffer)>>,
+}
+
+fn default_snapshot_version() -> u32 {
+    1
 }
 
 impl Default for CorrelationEngine {

@@ -44,8 +44,12 @@ impl DaemonEngine {
     }
 
     /// Load (or reload) rules from the configured path.
-    /// Returns Ok(()) on success, or an error string.
+    ///
+    /// On reload, correlation state is exported before replacing the engine
+    /// and re-imported after, so in-flight windows and suppression state
+    /// survive rule changes (entries for removed correlations are dropped).
     pub fn load_rules(&mut self) -> Result<EngineStats, String> {
+        let previous_state = self.export_state();
         let collection = load_collection(&self.rules_path)?;
         let has_correlations = !collection.correlations.is_empty();
 
@@ -59,10 +63,14 @@ impl DaemonEngine {
                 .add_collection(&collection)
                 .map_err(|e| format!("Error compiling rules: {e}"))?;
 
+            if let Some(snapshot) = previous_state {
+                engine.import_state(snapshot);
+            }
+
             let stats = EngineStats {
                 detection_rules: engine.detection_rule_count(),
                 correlation_rules: engine.correlation_rule_count(),
-                state_entries: 0,
+                state_entries: engine.state_count(),
             };
             self.engine = EngineVariant::WithCorrelations(Box::new(engine));
             Ok(stats)
@@ -128,10 +136,13 @@ impl DaemonEngine {
     }
 
     /// Import previously exported correlation state.
-    /// No-op if the engine is detection-only or snapshot is `None`.
-    pub fn import_state(&mut self, snapshot: &CorrelationSnapshot) {
+    /// Returns `true` if the import succeeded, `false` if the snapshot version
+    /// is incompatible. No-op (returns `true`) if the engine is detection-only.
+    pub fn import_state(&mut self, snapshot: &CorrelationSnapshot) -> bool {
         if let EngineVariant::WithCorrelations(engine) = &mut self.engine {
-            engine.import_state(snapshot.clone());
+            engine.import_state(snapshot.clone())
+        } else {
+            true
         }
     }
 }

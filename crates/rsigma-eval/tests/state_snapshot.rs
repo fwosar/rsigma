@@ -383,12 +383,13 @@ detection:
     // Engine with only detection rules, no correlations
     let mut engine = corr_engine(yaml);
     let snapshot = CorrelationSnapshot {
+        version: 1,
         windows: Default::default(),
         last_alert: Default::default(),
         event_buffers: Default::default(),
         event_ref_buffers: Default::default(),
     };
-    engine.import_state(snapshot);
+    assert!(engine.import_state(snapshot));
     assert_eq!(engine.state_count(), 0);
 }
 
@@ -410,4 +411,21 @@ fn expired_state_not_restored_after_window() {
         r.correlations.is_empty(),
         "old restored events should be evicted by the time window"
     );
+}
+
+#[test]
+fn import_rejects_incompatible_version() {
+    let mut engine = corr_engine(EVENT_COUNT_YAML);
+    process(&mut engine, login_event("admin"), 1000);
+    process(&mut engine, login_event("admin"), 1001);
+
+    let mut snapshot = engine.export_state();
+    snapshot.version = 999;
+
+    let mut engine2 = corr_engine(EVENT_COUNT_YAML);
+    assert!(
+        !engine2.import_state(snapshot),
+        "import should reject incompatible version"
+    );
+    assert_eq!(engine2.state_count(), 0, "no state should be imported");
 }

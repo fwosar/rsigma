@@ -95,13 +95,19 @@ pub async fn run_daemon(config: DaemonConfig) {
     if let Some(ref store) = state_store {
         match store.load().await {
             Ok(Some(snapshot)) => {
-                let entries = snapshot.windows.values().map(|g| g.len()).sum::<usize>();
                 let mut engine = shared_engine.lock().unwrap();
-                engine.import_state(&snapshot);
-                tracing::info!(
-                    state_entries = entries,
-                    "Correlation state restored from database"
-                );
+                if engine.import_state(&snapshot) {
+                    let entries = snapshot.windows.values().map(|g| g.len()).sum::<usize>();
+                    tracing::info!(
+                        state_entries = entries,
+                        "Correlation state restored from database"
+                    );
+                } else {
+                    tracing::warn!(
+                        snapshot_version = snapshot.version,
+                        "Incompatible snapshot version, starting with fresh state"
+                    );
+                }
             }
             Ok(None) => {
                 tracing::info!("No previous correlation state found in database");
