@@ -50,7 +50,8 @@ use regex::Regex;
 use crate::error::{EvalError, Result};
 
 pub use conditions::{
-    DetectionItemCondition, FieldNameCondition, RuleCondition, eval_condition_expr,
+    DetectionItemCondition, FieldNameCondition, NamedRuleCondition, RuleCondition,
+    eval_condition_expr,
 };
 pub use finalizers::Finalizer;
 pub use state::PipelineState;
@@ -83,7 +84,7 @@ pub struct TransformationItem {
     /// The transformation to apply.
     pub transformation: Transformation,
     /// Rule-level conditions (all must match for the transformation to fire).
-    pub rule_conditions: Vec<RuleCondition>,
+    pub rule_conditions: Vec<NamedRuleCondition>,
     /// Optional logical expression over condition IDs.
     pub rule_cond_expr: Option<String>,
     /// Detection-item-level conditions.
@@ -155,15 +156,11 @@ impl Pipeline {
             return true;
         }
 
-        // If there's a logical expression, evaluate it
         if let Some(ref expr) = item.rule_cond_expr {
-            // Build a map of condition ID -> result
-            // For this, conditions would need IDs, but the simple case is
-            // "all must match" (AND logic). We fall back to AND for now.
             let mut results = HashMap::new();
-            for (i, cond) in item.rule_conditions.iter().enumerate() {
-                let id = format!("cond_{i}");
-                results.insert(id, cond.matches_rule(rule, state));
+            for (i, named) in item.rule_conditions.iter().enumerate() {
+                let id = named.id.clone().unwrap_or_else(|| format!("cond_{i}"));
+                results.insert(id, named.condition.matches_rule(rule, state));
             }
             return eval_condition_expr(expr, &results);
         }
@@ -171,7 +168,7 @@ impl Pipeline {
         // Default: all conditions must match (AND)
         item.rule_conditions
             .iter()
-            .all(|c| c.matches_rule(rule, state))
+            .all(|c| c.condition.matches_rule(rule, state))
     }
 }
 
@@ -583,7 +580,7 @@ fn parse_transformation(obj: &serde_yaml::Mapping) -> Result<Transformation> {
 // Condition YAML parsing
 // =============================================================================
 
-fn parse_rule_conditions(value: &serde_yaml::Value) -> Result<Vec<RuleCondition>> {
+fn parse_rule_conditions(value: &serde_yaml::Value) -> Result<Vec<NamedRuleCondition>> {
     let items = value.as_sequence().ok_or_else(|| {
         EvalError::InvalidModifiers("rule_conditions must be a sequence".to_string())
     })?;
@@ -591,10 +588,15 @@ fn parse_rule_conditions(value: &serde_yaml::Value) -> Result<Vec<RuleCondition>
     items.iter().map(parse_rule_condition).collect()
 }
 
-fn parse_rule_condition(value: &serde_yaml::Value) -> Result<RuleCondition> {
+fn parse_rule_condition(value: &serde_yaml::Value) -> Result<NamedRuleCondition> {
     let obj = value.as_mapping().ok_or_else(|| {
         EvalError::InvalidModifiers("rule condition must be a mapping".to_string())
     })?;
+
+    let cond_id = obj
+        .get(ykey("id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let type_str = obj
         .get(ykey("type"))
@@ -603,7 +605,7 @@ fn parse_rule_condition(value: &serde_yaml::Value) -> Result<RuleCondition> {
             EvalError::InvalidModifiers("rule condition must have a 'type' field".to_string())
         })?;
 
-    match type_str {
+    let condition = match type_str {
         "logsource" => {
             let category = obj
                 .get(ykey("category"))
@@ -691,7 +693,12 @@ fn parse_rule_condition(value: &serde_yaml::Value) -> Result<RuleCondition> {
         other => Err(EvalError::InvalidModifiers(format!(
             "unknown rule condition type: {other}"
         ))),
-    }
+    }?;
+
+    Ok(NamedRuleCondition {
+        id: cond_id,
+        condition,
+    })
 }
 
 fn parse_detection_item_conditions(
@@ -1370,5 +1377,299 @@ transformations:
         assert_eq!(item.rule_conditions.len(), 8);
         assert_eq!(item.detection_item_conditions.len(), 4);
         assert_eq!(item.field_name_conditions.len(), 4);
+    }
+
+    #[test]
+    fn test_named_condition_ids_in_rule_cond_expression() {
+        let yaml = r#"
+name: Named Conditions
+transformations:
+  - type: field_name_prefix
+    prefix: "win."
+    rule_conditions:
+      - id: is_windows
+        type: logsource
+        product: windows
+      - id: is_process
+        type: logsource
+        category: process_creation
+    rule_cond_expression: "is_windows or is_process"
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+        let item = &pipeline.transformations[0];
+        assert_eq!(item.rule_conditions[0].id, Some("is_windows".to_string()));
+        assert_eq!(item.rule_conditions[1].id, Some("is_process".to_string()));
+
+        let mut rule = rsigma_parser::SigmaRule {
+            title: "Test".to_string(),
+            logsource: rsigma_parser::LogSource {
+                product: Some("windows".to_string()),
+                category: Some("process_creation".to_string()),
+                ..Default::default()
+            },
+            detection: rsigma_parser::Detections {
+                named: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "sel".to_string(),
+                        rsigma_parser::Detection::AllOf(vec![rsigma_parser::DetectionItem {
+                            field: rsigma_parser::FieldSpec::new(
+                                Some("CommandLine".to_string()),
+                                vec![],
+                            ),
+                            values: vec![SigmaValue::String(SigmaString::new("test"))],
+                        }]),
+                    );
+                    m
+                },
+                conditions: vec![rsigma_parser::ConditionExpr::Identifier("sel".to_string())],
+                condition_strings: vec!["sel".to_string()],
+                timeframe: None,
+            },
+            id: None,
+            name: None,
+            related: vec![],
+            taxonomy: None,
+            status: None,
+            description: None,
+            license: None,
+            author: None,
+            references: vec![],
+            date: None,
+            modified: None,
+            fields: vec![],
+            falsepositives: vec![],
+            level: None,
+            tags: vec![],
+            scope: vec![],
+            custom_attributes: HashMap::new(),
+        };
+
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        pipeline.apply(&mut rule, &mut state).unwrap();
+
+        let det = &rule.detection.named["sel"];
+        if let rsigma_parser::Detection::AllOf(items) = det {
+            assert_eq!(items[0].field.name, Some("win.CommandLine".to_string()));
+        } else {
+            panic!("Expected AllOf");
+        }
+    }
+
+    #[test]
+    fn test_named_cond_expression_or_logic() {
+        let yaml = r#"
+name: OR Logic
+transformations:
+  - type: field_name_prefix
+    prefix: "mapped."
+    rule_conditions:
+      - id: is_windows
+        type: logsource
+        product: windows
+      - id: is_process
+        type: logsource
+        category: process_creation
+    rule_cond_expression: "is_windows or is_process"
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+
+        let mut rule = rsigma_parser::SigmaRule {
+            title: "Linux Process".to_string(),
+            logsource: rsigma_parser::LogSource {
+                product: Some("linux".to_string()),
+                category: Some("process_creation".to_string()),
+                ..Default::default()
+            },
+            detection: rsigma_parser::Detections {
+                named: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "sel".to_string(),
+                        rsigma_parser::Detection::AllOf(vec![rsigma_parser::DetectionItem {
+                            field: rsigma_parser::FieldSpec::new(Some("Image".to_string()), vec![]),
+                            values: vec![SigmaValue::String(SigmaString::new("/bin/sh"))],
+                        }]),
+                    );
+                    m
+                },
+                conditions: vec![rsigma_parser::ConditionExpr::Identifier("sel".to_string())],
+                condition_strings: vec!["sel".to_string()],
+                timeframe: None,
+            },
+            id: None,
+            name: None,
+            related: vec![],
+            taxonomy: None,
+            status: None,
+            description: None,
+            license: None,
+            author: None,
+            references: vec![],
+            date: None,
+            modified: None,
+            fields: vec![],
+            falsepositives: vec![],
+            level: None,
+            tags: vec![],
+            scope: vec![],
+            custom_attributes: HashMap::new(),
+        };
+
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        pipeline.apply(&mut rule, &mut state).unwrap();
+
+        // is_windows=false, is_process=true => OR => applied
+        let det = &rule.detection.named["sel"];
+        if let rsigma_parser::Detection::AllOf(items) = det {
+            assert_eq!(items[0].field.name, Some("mapped.Image".to_string()));
+        } else {
+            panic!("Expected AllOf");
+        }
+    }
+
+    #[test]
+    fn test_named_cond_expression_and_logic() {
+        let yaml = r#"
+name: AND Logic
+transformations:
+  - type: field_name_prefix
+    prefix: "win."
+    rule_conditions:
+      - id: is_windows
+        type: logsource
+        product: windows
+      - id: is_process
+        type: logsource
+        category: process_creation
+    rule_cond_expression: "is_windows and is_process"
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+
+        // Linux + process_creation => is_windows=false => AND fails => no prefix
+        let mut rule = rsigma_parser::SigmaRule {
+            title: "Linux Rule".to_string(),
+            logsource: rsigma_parser::LogSource {
+                product: Some("linux".to_string()),
+                category: Some("process_creation".to_string()),
+                ..Default::default()
+            },
+            detection: rsigma_parser::Detections {
+                named: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "sel".to_string(),
+                        rsigma_parser::Detection::AllOf(vec![rsigma_parser::DetectionItem {
+                            field: rsigma_parser::FieldSpec::new(Some("Image".to_string()), vec![]),
+                            values: vec![SigmaValue::String(SigmaString::new("/bin/sh"))],
+                        }]),
+                    );
+                    m
+                },
+                conditions: vec![rsigma_parser::ConditionExpr::Identifier("sel".to_string())],
+                condition_strings: vec!["sel".to_string()],
+                timeframe: None,
+            },
+            id: None,
+            name: None,
+            related: vec![],
+            taxonomy: None,
+            status: None,
+            description: None,
+            license: None,
+            author: None,
+            references: vec![],
+            date: None,
+            modified: None,
+            fields: vec![],
+            falsepositives: vec![],
+            level: None,
+            tags: vec![],
+            scope: vec![],
+            custom_attributes: HashMap::new(),
+        };
+
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        pipeline.apply(&mut rule, &mut state).unwrap();
+
+        // is_windows=false => AND => not applied
+        let det = &rule.detection.named["sel"];
+        if let rsigma_parser::Detection::AllOf(items) = det {
+            assert_eq!(items[0].field.name, Some("Image".to_string()));
+        } else {
+            panic!("Expected AllOf");
+        }
+    }
+
+    #[test]
+    fn test_unnamed_conditions_fallback_to_cond_n() {
+        let yaml = r#"
+name: Fallback IDs
+transformations:
+  - type: field_name_prefix
+    prefix: "x."
+    rule_conditions:
+      - type: logsource
+        product: windows
+      - type: logsource
+        category: process_creation
+    rule_cond_expression: "cond_0 or cond_1"
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+        assert!(pipeline.transformations[0].rule_conditions[0].id.is_none());
+        assert!(pipeline.transformations[0].rule_conditions[1].id.is_none());
+
+        let mut rule = rsigma_parser::SigmaRule {
+            title: "Test".to_string(),
+            logsource: rsigma_parser::LogSource {
+                product: Some("linux".to_string()),
+                category: Some("process_creation".to_string()),
+                ..Default::default()
+            },
+            detection: rsigma_parser::Detections {
+                named: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "sel".to_string(),
+                        rsigma_parser::Detection::AllOf(vec![rsigma_parser::DetectionItem {
+                            field: rsigma_parser::FieldSpec::new(Some("Field".to_string()), vec![]),
+                            values: vec![SigmaValue::String(SigmaString::new("val"))],
+                        }]),
+                    );
+                    m
+                },
+                conditions: vec![rsigma_parser::ConditionExpr::Identifier("sel".to_string())],
+                condition_strings: vec!["sel".to_string()],
+                timeframe: None,
+            },
+            id: None,
+            name: None,
+            related: vec![],
+            taxonomy: None,
+            status: None,
+            description: None,
+            license: None,
+            author: None,
+            references: vec![],
+            date: None,
+            modified: None,
+            fields: vec![],
+            falsepositives: vec![],
+            level: None,
+            tags: vec![],
+            scope: vec![],
+            custom_attributes: HashMap::new(),
+        };
+
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        pipeline.apply(&mut rule, &mut state).unwrap();
+
+        // cond_0 (windows)=false, cond_1 (process_creation)=true => OR => applied
+        let det = &rule.detection.named["sel"];
+        if let rsigma_parser::Detection::AllOf(items) = det {
+            assert_eq!(items[0].field.name, Some("x.Field".to_string()));
+        } else {
+            panic!("Expected AllOf");
+        }
     }
 }
