@@ -298,6 +298,9 @@ pub async fn run_daemon(config: DaemonConfig) {
                     .set(stats.state_entries as i64);
                 result
             };
+            if result.detections.is_empty() && result.correlations.is_empty() {
+                continue;
+            }
             if sink_tx.send(result).await.is_err() {
                 tracing::debug!("Sink channel closed, engine shutting down");
                 break;

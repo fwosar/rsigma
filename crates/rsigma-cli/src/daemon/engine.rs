@@ -54,12 +54,12 @@ pub fn process_line(
         metrics.events_processed.inc();
         metrics.processing_latency.observe(elapsed);
 
-        for _ in &result.detections {
-            metrics.detection_matches.inc();
-        }
-        for _ in &result.correlations {
-            metrics.correlation_matches.inc();
-        }
+        metrics
+            .detection_matches
+            .inc_by(result.detections.len() as u64);
+        metrics
+            .correlation_matches
+            .inc_by(result.correlations.len() as u64);
 
         merged.detections.extend(result.detections);
         merged.correlations.extend(result.correlations);

@@ -1,4 +1,4 @@
-use async_nats::Client;
+use async_nats::{Client, subject::Subject};
 
 use rsigma_eval::ProcessResult;
 
@@ -7,7 +7,7 @@ use super::StreamingError;
 /// Publishes ProcessResult as NDJSON to a NATS subject.
 pub struct NatsSink {
     client: Client,
-    subject: String,
+    subject: Subject,
 }
 
 impl NatsSink {
@@ -16,7 +16,7 @@ impl NatsSink {
         let client = async_nats::connect(url).await?;
         Ok(NatsSink {
             client,
-            subject: subject.to_string(),
+            subject: Subject::from(subject),
         })
     }
 

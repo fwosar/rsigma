@@ -78,7 +78,10 @@ pub enum Sink {
 
 impl Sink {
     /// Serialize and deliver a ProcessResult to this sink.
-    /// Uses `Box::pin` for the FanOut case to handle recursive async.
+    ///
+    /// Synchronous sinks (Stdout, File) use `block_in_place` to avoid blocking
+    /// the Tokio runtime. Uses `Box::pin` for the FanOut case to handle
+    /// recursive async.
     pub fn send<'a>(
         &'a mut self,
         result: &'a ProcessResult,
@@ -86,8 +89,16 @@ impl Sink {
     {
         Box::pin(async move {
             match self {
-                Sink::Stdout(s) => s.send(result),
-                Sink::File(s) => s.send(result),
+                Sink::Stdout(s) => {
+                    let s = &*s;
+                    let result = result;
+                    tokio::task::block_in_place(|| s.send(result))
+                }
+                Sink::File(s) => {
+                    let s = &mut *s;
+                    let result = result;
+                    tokio::task::block_in_place(|| s.send(result))
+                }
                 #[cfg(feature = "daemon-nats")]
                 Sink::Nats(s) => s.send(result).await,
                 Sink::FanOut(sinks) => {
