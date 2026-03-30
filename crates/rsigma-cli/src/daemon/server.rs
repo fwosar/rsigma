@@ -328,7 +328,7 @@ pub async fn run_daemon(config: DaemonConfig) {
     tracing::info!(output = ?output_specs, "Sink started");
 
     // Sink task: reads ProcessResult from channel, writes via Sink dispatch
-    let _sink_handle = tokio::spawn(async move {
+    let sink_handle = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(result) = sink_rx.recv().await {
             if let Err(e) = sink.send(&result).await {
@@ -347,6 +347,11 @@ pub async fn run_daemon(config: DaemonConfig) {
             tracing::info!("Streaming pipeline complete");
         }
     }
+
+    // Wait for the sink task to drain any remaining results before exiting.
+    // The engine task owns sink_tx, so once it exits, sink_rx closes and the
+    // sink task finishes after processing buffered items.
+    let _ = sink_handle.await;
 
     // Save state on shutdown
     if let Some(ref store) = state_store {
