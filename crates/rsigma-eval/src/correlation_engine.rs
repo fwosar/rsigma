@@ -4164,4 +4164,125 @@ level: high
             Some(CorrelationAction::Reset)
         );
     }
+
+    #[test]
+    fn test_process_with_detections_matches_process_event_at() {
+        let yaml = r#"
+title: Login Failure
+id: login-fail
+logsource:
+    category: auth
+detection:
+    selection:
+        EventType: login_failure
+    condition: selection
+---
+title: Brute Force
+correlation:
+    type: event_count
+    rules:
+        - login-fail
+    group-by:
+        - User
+    timespan: 60s
+    condition:
+        gte: 3
+level: high
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+
+        // Run with process_event_at
+        let mut engine1 = CorrelationEngine::new(CorrelationConfig::default());
+        engine1.add_collection(&collection).unwrap();
+
+        let events: Vec<serde_json::Value> = (0..5)
+            .map(|i| json!({"EventType": "login_failure", "User": "admin", "@timestamp": format!("2025-01-01T00:00:0{}Z", i + 1)}))
+            .collect();
+
+        let results1: Vec<ProcessResult> = events
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let e = Event::from_value(v);
+                engine1.process_event_at(&e, 1000 + i as i64)
+            })
+            .collect();
+
+        // Run with evaluate + process_with_detections
+        let mut engine2 = CorrelationEngine::new(CorrelationConfig::default());
+        engine2.add_collection(&collection).unwrap();
+
+        let results2: Vec<ProcessResult> = events
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let e = Event::from_value(v);
+                let detections = engine2.evaluate(&e);
+                engine2.process_with_detections(&e, detections, 1000 + i as i64)
+            })
+            .collect();
+
+        // Same number of results
+        assert_eq!(results1.len(), results2.len());
+        for (r1, r2) in results1.iter().zip(results2.iter()) {
+            assert_eq!(r1.detections.len(), r2.detections.len());
+            assert_eq!(r1.correlations.len(), r2.correlations.len());
+        }
+    }
+
+    #[test]
+    fn test_process_batch_matches_sequential() {
+        let yaml = r#"
+title: Login Failure
+id: login-fail-batch
+logsource:
+    category: auth
+detection:
+    selection:
+        EventType: login_failure
+    condition: selection
+---
+title: Brute Force Batch
+correlation:
+    type: event_count
+    rules:
+        - login-fail-batch
+    group-by:
+        - User
+    timespan: 60s
+    condition:
+        gte: 3
+level: high
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+
+        let event_values: Vec<serde_json::Value> = (0..5)
+            .map(|i| json!({"EventType": "login_failure", "User": "admin", "@timestamp": format!("2025-01-01T00:00:0{}Z", i + 1)}))
+            .collect();
+
+        // Sequential
+        let mut engine1 = CorrelationEngine::new(CorrelationConfig::default());
+        engine1.add_collection(&collection).unwrap();
+        let sequential: Vec<ProcessResult> = event_values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let e = Event::from_value(v);
+                engine1.process_event_at(&e, 1000 + i as i64)
+            })
+            .collect();
+
+        // Batch
+        let mut engine2 = CorrelationEngine::new(CorrelationConfig::default());
+        engine2.add_collection(&collection).unwrap();
+        let events: Vec<Event> = event_values.iter().map(Event::from_value).collect();
+        let refs: Vec<&Event> = events.iter().collect();
+        let batch = engine2.process_batch(&refs);
+
+        assert_eq!(sequential.len(), batch.len());
+        for (seq, bat) in sequential.iter().zip(batch.iter()) {
+            assert_eq!(seq.detections.len(), bat.detections.len());
+            assert_eq!(seq.correlations.len(), bat.correlations.len());
+        }
+    }
 }

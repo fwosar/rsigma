@@ -1560,4 +1560,59 @@ level: low
         let ev = json!({"winlog.CommandLine": "testing"});
         assert_eq!(engine.evaluate(&Event::from_value(&ev)).len(), 1);
     }
+
+    #[test]
+    fn test_evaluate_batch_matches_sequential() {
+        let yaml = r#"
+title: Login
+logsource:
+    product: windows
+detection:
+    selection:
+        EventType: 'login'
+    condition: selection
+---
+title: Process Create
+logsource:
+    product: windows
+detection:
+    selection:
+        EventType: 'process_create'
+    condition: selection
+---
+title: Keyword
+logsource:
+    product: windows
+detection:
+    selection:
+        CommandLine|contains: 'whoami'
+    condition: selection
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        let mut engine = Engine::new();
+        engine.add_collection(&collection).unwrap();
+
+        let vals = [
+            json!({"EventType": "login", "User": "admin"}),
+            json!({"EventType": "process_create", "CommandLine": "whoami"}),
+            json!({"EventType": "file_create"}),
+            json!({"CommandLine": "whoami /all"}),
+        ];
+        let events: Vec<Event> = vals.iter().map(Event::from_value).collect();
+
+        // Sequential
+        let sequential: Vec<Vec<_>> = events.iter().map(|e| engine.evaluate(e)).collect();
+
+        // Batch
+        let refs: Vec<&Event> = events.iter().collect();
+        let batch = engine.evaluate_batch(&refs);
+
+        assert_eq!(sequential.len(), batch.len());
+        for (seq, bat) in sequential.iter().zip(batch.iter()) {
+            assert_eq!(seq.len(), bat.len());
+            for (s, b) in seq.iter().zip(bat.iter()) {
+                assert_eq!(s.rule_title, b.rule_title);
+            }
+        }
+    }
 }
