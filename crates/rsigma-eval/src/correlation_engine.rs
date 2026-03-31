@@ -573,13 +573,14 @@ impl CorrelationEngine {
     /// - `WallClock`: use `Utc::now()` (good for real-time streaming)
     /// - `Skip`: return detections only, skip correlation state updates
     pub fn process_event(&mut self, event: &Event) -> ProcessResult {
+        let all_detections = self.engine.evaluate(event);
+
         let ts = match self.extract_event_timestamp(event) {
             Some(ts) => ts,
             None => match self.config.timestamp_fallback {
                 TimestampFallback::WallClock => Utc::now().timestamp(),
                 TimestampFallback::Skip => {
                     // Still run detection (stateless), but skip correlation
-                    let all_detections = self.engine.evaluate(event);
                     let detections = self.filter_detections(all_detections);
                     return ProcessResult {
                         detections,
@@ -588,7 +589,7 @@ impl CorrelationEngine {
                 }
             },
         };
-        self.process_event_at(event, ts)
+        self.process_with_detections(event, all_detections, ts)
     }
 
     /// Process an event with an explicit Unix epoch timestamp (seconds).
@@ -596,30 +597,51 @@ impl CorrelationEngine {
     /// The timestamp is clamped to `[0, i64::MAX / 2]` to prevent overflow
     /// when adding timespan durations internally.
     pub fn process_event_at(&mut self, event: &Event, timestamp_secs: i64) -> ProcessResult {
+        let all_detections = self.engine.evaluate(event);
+        self.process_with_detections(event, all_detections, timestamp_secs)
+    }
+
+    /// Process an event with pre-computed detection results.
+    ///
+    /// Enables external parallelism: callers can run detection (via
+    /// [`evaluate`](Self::evaluate)) in parallel, then feed results here
+    /// sequentially for stateful correlation.
+    pub fn process_with_detections(
+        &mut self,
+        event: &Event,
+        all_detections: Vec<MatchResult>,
+        timestamp_secs: i64,
+    ) -> ProcessResult {
         let timestamp_secs = timestamp_secs.clamp(0, i64::MAX / 2);
 
-        // Step 1: Memory management — evict before adding new state to enforce limit
+        // Memory management — evict before adding new state to enforce limit
         if self.state.len() >= self.config.max_state_entries {
             self.evict_all(timestamp_secs);
         }
 
-        // Step 2: Run stateless detection
-        let all_detections = self.engine.evaluate(event);
-
-        // Step 3: Feed detection matches into correlations
+        // Feed detection matches into correlations
         let mut correlations = Vec::new();
         self.feed_detections(event, &all_detections, timestamp_secs, &mut correlations);
 
-        // Step 4: Chain — correlation results may trigger higher-level correlations
+        // Chain — correlation results may trigger higher-level correlations
         self.chain_correlations(&correlations, timestamp_secs);
 
-        // Step 5: Filter detections by generate flag
+        // Filter detections by generate flag
         let detections = self.filter_detections(all_detections);
 
         ProcessResult {
             detections,
             correlations,
         }
+    }
+
+    /// Run stateless detection only (no correlation), delegating to the inner engine.
+    ///
+    /// Takes `&self` so it can be called concurrently from multiple threads
+    /// (e.g. via `rayon::par_iter`) while the mutable correlation phase runs
+    /// sequentially afterwards.
+    pub fn evaluate(&self, event: &Event) -> Vec<MatchResult> {
+        self.engine.evaluate(event)
     }
 
     /// Filter detections by the `generate` flag / `emit_detections` config.
