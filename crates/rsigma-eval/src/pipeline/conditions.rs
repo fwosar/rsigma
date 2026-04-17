@@ -469,6 +469,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
         let state = PipelineState::default();
 
@@ -516,6 +517,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         assert!(RuleCondition::IsSigmaRule.matches_rule(&rule, &state));
@@ -551,6 +553,7 @@ mod tests {
             tags: vec!["attack.execution".to_string(), "attack.t1059".to_string()],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         assert!(
@@ -633,6 +636,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         assert!(!cond.matches_rule(&rule, &state));

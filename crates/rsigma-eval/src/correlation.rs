@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as IoRead, Write as IoWrite};
+use std::sync::Arc;
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
@@ -58,6 +59,9 @@ pub struct CompiledCorrelation {
     /// Maximum events to store per window group for event inclusion.
     /// `None` means use the engine default (`CorrelationConfig.max_correlation_events`).
     pub max_events: Option<usize>,
+    /// Custom rule attributes from the original Sigma correlation rule YAML.
+    /// Wrapped in `Arc` so that per-match cloning is a pointer bump.
+    pub custom_rule_attributes: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// A group-by field, potentially aliased per referenced rule.
@@ -851,6 +855,10 @@ pub fn compile_correlation(rule: &CorrelationRule) -> Result<CompiledCorrelation
         .get("rsigma.max_correlation_events")
         .and_then(|v| v.parse::<usize>().ok());
 
+    let custom_rule_attributes = Arc::new(crate::compiler::yaml_to_json_map(
+        &rule.custom_rule_attributes,
+    ));
+
     Ok(CompiledCorrelation {
         id: rule.id.clone(),
         name: rule.name.clone(),
@@ -868,6 +876,7 @@ pub fn compile_correlation(rule: &CorrelationRule) -> Result<CompiledCorrelation
         action,
         event_mode,
         max_events,
+        custom_rule_attributes,
     })
 }
 
@@ -1697,7 +1706,9 @@ level: high
             date: None,
             modified: None,
             references: vec![],
+            taxonomy: None,
             tags: vec![],
+            falsepositives: vec![],
             level: Some(Level::High),
             correlation_type: CorrelationType::EventCount,
             rules: vec!["rule-1".to_string()],
@@ -1710,6 +1721,7 @@ level: high
             aliases: vec![],
             generate: false,
             custom_attributes,
+            custom_rule_attributes: HashMap::new(),
         };
 
         let compiled = compile_correlation(&rule).unwrap();

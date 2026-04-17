@@ -13,6 +13,7 @@
 //! 4. Correlation results can chain into higher-level correlations
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
@@ -242,6 +243,11 @@ pub struct CorrelationResult {
     /// Contains up to `max_correlation_events` timestamp + optional ID pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_refs: Option<Vec<EventRef>>,
+    /// Custom rule attributes from the original Sigma correlation rule YAML.
+    /// Contains any non-standard top-level fields from the rule definition.
+    /// Wrapped in `Arc` so that per-match cloning is a pointer bump.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub custom_rule_attributes: Arc<HashMap<String, serde_json::Value>>,
 }
 
 // =============================================================================
@@ -954,6 +960,7 @@ impl CorrelationEngine {
                     timespan_secs: timespan,
                     events,
                     event_refs,
+                    custom_rule_attributes: corr.custom_rule_attributes.clone(),
                 };
                 out.push(result);
 
@@ -1057,6 +1064,7 @@ impl CorrelationEngine {
                         // over correlation results, not raw events)
                         events: None,
                         event_refs: None,
+                        custom_rule_attributes: corr.custom_rule_attributes.clone(),
                     });
                 }
             }
@@ -4284,5 +4292,102 @@ level: high
             assert_eq!(seq.detections.len(), bat.detections.len());
             assert_eq!(seq.correlations.len(), bat.correlations.len());
         }
+    }
+
+    #[test]
+    fn test_correlation_result_custom_rule_attributes() {
+        let yaml = r#"
+title: Login
+id: login-cra
+logsource:
+    category: auth
+detection:
+    selection:
+        EventType: login
+    condition: selection
+level: low
+---
+title: Many Logins
+my_custom_field: hello
+priority: 9
+nested:
+    key: value
+correlation:
+    type: event_count
+    rules:
+        - login-cra
+    group-by:
+        - User
+    timespan: 60s
+    condition:
+        gte: 2
+level: high
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        engine.add_collection(&collection).unwrap();
+
+        let base_ts = 1000i64;
+        for i in 0..2 {
+            let v = json!({"EventType": "login", "User": "alice"});
+            let event = Event::from_value(&v);
+            let result = engine.process_event_at(&event, base_ts + i * 10);
+
+            if i == 1 {
+                assert_eq!(result.correlations.len(), 1);
+                let corr = &result.correlations[0];
+                assert_eq!(corr.rule_title, "Many Logins");
+                assert_eq!(
+                    corr.custom_rule_attributes.get("my_custom_field"),
+                    Some(&serde_json::Value::String("hello".to_string()))
+                );
+                assert_eq!(
+                    corr.custom_rule_attributes.get("priority"),
+                    Some(&serde_json::json!(9))
+                );
+                let nested = corr.custom_rule_attributes.get("nested").unwrap();
+                assert_eq!(nested.get("key"), Some(&serde_json::json!("value")));
+
+                // Standard fields must not leak into custom_rule_attributes
+                assert!(!corr.custom_rule_attributes.contains_key("title"));
+                assert!(!corr.custom_rule_attributes.contains_key("correlation"));
+                assert!(!corr.custom_rule_attributes.contains_key("level"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_detection_result_custom_rule_attributes() {
+        let yaml = r#"
+title: Login Detection
+logsource:
+    category: auth
+detection:
+    selection:
+        EventType: login
+    condition: selection
+level: low
+my_detection_tag: important
+score: 42
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        engine.add_collection(&collection).unwrap();
+
+        let v = json!({"EventType": "login"});
+        let event = Event::from_value(&v);
+        let result = engine.process_event(&event);
+
+        assert_eq!(result.detections.len(), 1);
+        let det = &result.detections[0];
+        assert_eq!(
+            det.custom_rule_attributes.get("my_detection_tag"),
+            Some(&serde_json::Value::String("important".to_string()))
+        );
+        assert_eq!(
+            det.custom_rule_attributes.get("score"),
+            Some(&serde_json::json!(42))
+        );
+        assert!(!det.custom_rule_attributes.contains_key("title"));
     }
 }

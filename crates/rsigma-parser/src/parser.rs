@@ -236,6 +236,56 @@ fn parse_detection_rule(value: &Value) -> Result<SigmaRule> {
         .transpose()?
         .unwrap_or_default();
 
+    // Custom attributes (rsigma.* extension keys) — mirrors pySigma's
+    // `SigmaRule.custom_attributes`. Parsed from the top-level `custom_attributes`
+    // mapping; pipeline transformations may also populate this field.
+    let custom_attributes: HashMap<String, String> = m
+        .get(val_key("custom_attributes"))
+        .and_then(|v| v.as_mapping())
+        .map(|attrs| {
+            attrs
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Collect custom rule attributes: any top-level key not in the standard schema
+    let standard_rule_keys: &[&str] = &[
+        "title",
+        "id",
+        "related",
+        "name",
+        "taxonomy",
+        "status",
+        "description",
+        "license",
+        "author",
+        "references",
+        "date",
+        "modified",
+        "logsource",
+        "detection",
+        "fields",
+        "falsepositives",
+        "level",
+        "tags",
+        "scope",
+        "custom_attributes",
+    ];
+
+    let custom_rule_attributes: HashMap<String, Value> = m
+        .iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_str()?;
+            if standard_rule_keys.contains(&key) {
+                None
+            } else {
+                Some((key.to_string(), v.clone()))
+            }
+        })
+        .collect();
+
     Ok(SigmaRule {
         title,
         logsource,
@@ -256,7 +306,8 @@ fn parse_detection_rule(value: &Value) -> Result<SigmaRule> {
         level: get_str(m, "level").and_then(|s| s.parse().ok()),
         tags: get_str_list(m, "tags"),
         scope: get_str_list(m, "scope"),
-        custom_attributes: HashMap::new(),
+        custom_attributes,
+        custom_rule_attributes,
     })
 }
 
@@ -542,10 +593,12 @@ fn parse_correlation_rule(value: &Value) -> Result<CorrelationRule> {
         .ok_or_else(|| SigmaParserError::InvalidCorrelation("Missing timeframe".into()))?;
     let timespan = Timespan::parse(timespan_str)?;
 
-    // Generate flag
-    let generate = corr
+    // Generate flag - Sigma correlation schema defines `generate` at document root.
+    // Nested `correlation.generate` is accepted for backward compatibility.
+    let generate = m
         .get(val_key("generate"))
         .and_then(|v| v.as_bool())
+        .or_else(|| corr.get(val_key("generate")).and_then(|v| v.as_bool()))
         .unwrap_or(false);
 
     // Condition
@@ -555,15 +608,50 @@ fn parse_correlation_rule(value: &Value) -> Result<CorrelationRule> {
     let aliases = parse_correlation_aliases(corr);
 
     // Custom attributes (rsigma.* extension keys)
-    let custom_attributes = if let Some(Value::Mapping(attrs)) = m.get(val_key("custom_attributes"))
-    {
-        attrs
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let custom_attributes: HashMap<String, String> = m
+        .get(val_key("custom_attributes"))
+        .and_then(|v| v.as_mapping())
+        .map(|attrs| {
+            attrs
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Collect custom correlation rule attributes: any top-level key not in the standard schema
+    // Top-level keys from the Sigma correlation-rules JSON schema plus keys this
+    // parser reads from the document root (including common extensions).
+    let standard_correlation_keys: &[&str] = &[
+        "author",
+        "correlation",
+        "custom_attributes",
+        "date",
+        "description",
+        "falsepositives",
+        "generate",
+        "id",
+        "level",
+        "modified",
+        "name",
+        "references",
+        "status",
+        "tags",
+        "taxonomy",
+        "title",
+    ];
+
+    let custom_rule_attributes: HashMap<String, Value> = m
+        .iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_str()?;
+            if standard_correlation_keys.contains(&key) {
+                None
+            } else {
+                Some((key.to_string(), v.clone()))
+            }
+        })
+        .collect();
 
     Ok(CorrelationRule {
         title,
@@ -575,7 +663,9 @@ fn parse_correlation_rule(value: &Value) -> Result<CorrelationRule> {
         date: get_str(m, "date").map(|s| s.to_string()),
         modified: get_str(m, "modified").map(|s| s.to_string()),
         references: get_str_list(m, "references"),
+        taxonomy: get_str(m, "taxonomy").map(|s| s.to_string()),
         tags: get_str_list(m, "tags"),
+        falsepositives: get_str_list(m, "falsepositives"),
         level: get_str(m, "level").and_then(|s| s.parse().ok()),
         correlation_type,
         rules,
@@ -585,6 +675,7 @@ fn parse_correlation_rule(value: &Value) -> Result<CorrelationRule> {
         aliases,
         generate,
         custom_attributes,
+        custom_rule_attributes,
     })
 }
 
@@ -1858,5 +1949,232 @@ level: medium
             collection.errors
         );
         assert_eq!(collection.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_detection_rule_custom_rule_attributes() {
+        let yaml = r#"
+title: Test Rule With Custom Attrs
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    selection:
+        CommandLine|contains: 'whoami'
+    condition: selection
+level: medium
+my_custom_field: some_value
+severity_score: 42
+organization: ACME Corp
+custom_list:
+    - item1
+    - item2
+custom_object:
+    key1: val1
+    key2: val2
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        assert_eq!(collection.rules.len(), 1);
+
+        let rule = &collection.rules[0];
+        assert_eq!(rule.title, "Test Rule With Custom Attrs");
+
+        // Custom rule attributes should be captured
+        assert_eq!(
+            rule.custom_rule_attributes.get("my_custom_field"),
+            Some(&Value::String("some_value".to_string()))
+        );
+        assert_eq!(
+            rule.custom_rule_attributes
+                .get("severity_score")
+                .and_then(|v| v.as_u64()),
+            Some(42)
+        );
+        assert_eq!(
+            rule.custom_rule_attributes.get("organization"),
+            Some(&Value::String("ACME Corp".to_string()))
+        );
+
+        // List values should be preserved
+        let custom_list = rule.custom_rule_attributes.get("custom_list").unwrap();
+        assert!(custom_list.is_sequence());
+
+        // Object values should be preserved
+        let custom_obj = rule.custom_rule_attributes.get("custom_object").unwrap();
+        assert!(custom_obj.is_mapping());
+
+        // Standard fields should NOT be in custom_rule_attributes
+        assert!(!rule.custom_rule_attributes.contains_key("title"));
+        assert!(!rule.custom_rule_attributes.contains_key("logsource"));
+        assert!(!rule.custom_rule_attributes.contains_key("detection"));
+        assert!(!rule.custom_rule_attributes.contains_key("level"));
+    }
+
+    #[test]
+    fn test_parse_detection_rule_no_custom_rule_attributes() {
+        let yaml = r#"
+title: Standard Rule
+logsource:
+    category: test
+detection:
+    selection:
+        field: value
+    condition: selection
+level: low
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        let rule = &collection.rules[0];
+        assert!(rule.custom_rule_attributes.is_empty());
+        assert!(rule.custom_attributes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_detection_rule_custom_attributes() {
+        let yaml = r#"
+title: Rule With Custom Attrs
+custom_attributes:
+    rsigma.suppress: 5m
+    rsigma.action: reset
+logsource:
+    category: test
+detection:
+    selection:
+        field: value
+    condition: selection
+level: low
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        let rule = &collection.rules[0];
+        assert_eq!(
+            rule.custom_attributes.get("rsigma.suppress"),
+            Some(&"5m".to_string())
+        );
+        assert_eq!(
+            rule.custom_attributes.get("rsigma.action"),
+            Some(&"reset".to_string())
+        );
+        // Reserved key — must not leak into custom_rule_attributes
+        assert!(
+            !rule
+                .custom_rule_attributes
+                .contains_key("custom_attributes")
+        );
+    }
+
+    #[test]
+    fn test_parse_correlation_rule_custom_rule_attributes() {
+        let yaml = r#"
+title: Login
+id: login-rule
+logsource:
+    category: auth
+detection:
+    selection:
+        EventType: login
+    condition: selection
+---
+title: Many Logins
+name: reserved_name
+tags:
+    - test.tag
+taxonomy: test.taxonomy
+falsepositives:
+    - benign activity
+generate: false
+my_custom_correlation_field: custom_value
+priority: high_priority
+correlation:
+    type: event_count
+    rules:
+        - login-rule
+    group-by:
+        - User
+    timespan: 60s
+    condition:
+        gte: 3
+level: high
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        assert_eq!(collection.correlations.len(), 1);
+
+        let corr = &collection.correlations[0];
+        assert_eq!(
+            corr.custom_rule_attributes
+                .get("my_custom_correlation_field"),
+            Some(&Value::String("custom_value".to_string()))
+        );
+        assert_eq!(
+            corr.custom_rule_attributes.get("priority"),
+            Some(&Value::String("high_priority".to_string()))
+        );
+
+        // Standard correlation fields should NOT be in custom_rule_attributes
+        assert!(!corr.custom_rule_attributes.contains_key("title"));
+        assert!(!corr.custom_rule_attributes.contains_key("correlation"));
+        assert!(!corr.custom_rule_attributes.contains_key("level"));
+        assert!(!corr.custom_rule_attributes.contains_key("id"));
+        assert!(!corr.custom_rule_attributes.contains_key("name"));
+        assert!(!corr.custom_rule_attributes.contains_key("tags"));
+        assert!(!corr.custom_rule_attributes.contains_key("taxonomy"));
+        assert!(!corr.custom_rule_attributes.contains_key("falsepositives"));
+        assert!(!corr.custom_rule_attributes.contains_key("generate"));
+    }
+
+    #[test]
+    fn test_parse_correlation_rule_schema_top_level_metadata() {
+        let yaml = r#"
+title: Login
+id: login-rule
+logsource:
+    category: auth
+detection:
+    selection:
+        EventType: login
+    condition: selection
+---
+title: Many Logins
+name: bucket_enum_corr
+tags:
+    - attack.collection
+taxonomy: enterprise_attack
+falsepositives:
+    - Scheduled backups
+generate: true
+correlation:
+    type: event_count
+    rules:
+        - login-rule
+    group-by:
+        - User
+    timespan: 60s
+    condition:
+        gte: 3
+level: high
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        assert_eq!(collection.correlations.len(), 1);
+        let corr = &collection.correlations[0];
+        assert_eq!(corr.name.as_deref(), Some("bucket_enum_corr"));
+        assert_eq!(corr.tags, vec!["attack.collection"]);
+        assert_eq!(corr.taxonomy.as_deref(), Some("enterprise_attack"));
+        assert_eq!(corr.falsepositives, vec!["Scheduled backups"]);
+        assert!(corr.generate);
+    }
+
+    #[test]
+    fn test_parse_correlation_generate_nested_fallback() {
+        let yaml = r#"
+title: Nested Gen
+correlation:
+    type: temporal
+    rules:
+        - a
+    group-by:
+        - x
+    timespan: 1m
+    generate: true
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        assert!(collection.correlations[0].generate);
     }
 }
