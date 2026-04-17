@@ -1859,5 +1859,4 @@ level: medium
         );
         assert_eq!(collection.rules.len(), 1);
     }
-
 }
