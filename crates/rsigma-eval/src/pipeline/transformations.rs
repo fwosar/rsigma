@@ -1490,6 +1490,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         }
     }
 
@@ -1741,6 +1742,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::default();
@@ -2253,6 +2255,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::default();
@@ -2309,6 +2312,7 @@ mod tests {
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::default();

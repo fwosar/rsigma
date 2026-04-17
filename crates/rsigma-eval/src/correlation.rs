@@ -58,6 +58,8 @@ pub struct CompiledCorrelation {
     /// Maximum events to store per window group for event inclusion.
     /// `None` means use the engine default (`CorrelationConfig.max_correlation_events`).
     pub max_events: Option<usize>,
+    /// Custom rule attributes from the original Sigma correlation rule YAML.
+    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
 }
 
 /// A group-by field, potentially aliased per referenced rule.
@@ -851,6 +853,8 @@ pub fn compile_correlation(rule: &CorrelationRule) -> Result<CompiledCorrelation
         .get("rsigma.max_correlation_events")
         .and_then(|v| v.parse::<usize>().ok());
 
+    let custom_rule_attributes = crate::compiler::yaml_to_json_map(&rule.custom_rule_attributes);
+
     Ok(CompiledCorrelation {
         id: rule.id.clone(),
         name: rule.name.clone(),
@@ -868,6 +872,7 @@ pub fn compile_correlation(rule: &CorrelationRule) -> Result<CompiledCorrelation
         action,
         event_mode,
         max_events,
+        custom_rule_attributes,
     })
 }
 
@@ -1710,6 +1715,7 @@ level: high
             aliases: vec![],
             generate: false,
             custom_attributes,
+            custom_rule_attributes: HashMap::new(),
         };
 
         let compiled = compile_correlation(&rule).unwrap();

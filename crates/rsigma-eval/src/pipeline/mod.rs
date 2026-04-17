@@ -1288,6 +1288,7 @@ transformations:
             tags: vec![],
             scope: vec![],
             custom_attributes: std::collections::HashMap::new(),
+            custom_rule_attributes: std::collections::HashMap::new(),
         };
 
         let mut state = PipelineState::new(pipeline.vars.clone());
@@ -1361,6 +1362,7 @@ transformations:
             tags: vec![],
             scope: vec![],
             custom_attributes: std::collections::HashMap::new(),
+            custom_rule_attributes: std::collections::HashMap::new(),
         };
 
         let mut state = PipelineState::new(pipeline.vars.clone());
@@ -1602,6 +1604,7 @@ transformations:
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::new(pipeline.vars.clone());
@@ -1674,6 +1677,7 @@ transformations:
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::new(pipeline.vars.clone());
@@ -1748,6 +1752,7 @@ transformations:
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::new(pipeline.vars.clone());
@@ -1820,6 +1825,7 @@ transformations:
             tags: vec![],
             scope: vec![],
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         };
 
         let mut state = PipelineState::new(pipeline.vars.clone());
@@ -1869,6 +1875,7 @@ transformations:
             }],
             generate: true,
             custom_attributes: HashMap::new(),
+            custom_rule_attributes: HashMap::new(),
         }
     }
 

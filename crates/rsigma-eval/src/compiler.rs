@@ -43,6 +43,9 @@ pub struct CompiledRule {
     /// Whether to include the full event JSON in the match result.
     /// Controlled by the `rsigma.include_event` custom attribute.
     pub include_event: bool,
+    /// Custom rule attributes from the original Sigma rule YAML.
+    /// Non-standard top-level fields are propagated to match results.
+    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
 }
 
 /// A compiled detection definition.
@@ -204,6 +207,8 @@ pub fn compile_rule(rule: &SigmaRule) -> Result<CompiledRule> {
         .get("rsigma.include_event")
         .is_some_and(|v| v == "true");
 
+    let custom_rule_attributes = yaml_to_json_map(&rule.custom_rule_attributes);
+
     Ok(CompiledRule {
         title: rule.title.clone(),
         id: rule.id.clone(),
@@ -213,6 +218,7 @@ pub fn compile_rule(rule: &SigmaRule) -> Result<CompiledRule> {
         detections,
         conditions: rule.detection.conditions.clone(),
         include_event,
+        custom_rule_attributes,
     })
 }
 
@@ -265,6 +271,7 @@ pub fn evaluate_rule(rule: &CompiledRule, event: &Event) -> Option<MatchResult> 
                 matched_selections,
                 matched_fields,
                 event: event_data,
+                custom_rule_attributes: rule.custom_rule_attributes.clone(),
             });
         }
     }
@@ -845,6 +852,50 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
         return name.ends_with(suffix);
     }
     pattern == name
+}
+
+// =============================================================================
+// YAML → JSON conversion
+// =============================================================================
+
+/// Convert a `serde_yaml::Value` to a `serde_json::Value`.
+fn yaml_to_json(value: &serde_yaml::Value) -> serde_json::Value {
+    match value {
+        serde_yaml::Value::Null => serde_json::Value::Null,
+        serde_yaml::Value::Bool(b) => serde_json::Value::Bool(*b),
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::Number(i.into())
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::Number(u.into())
+            } else if let Some(f) = n.as_f64() {
+                serde_json::json!(f)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        serde_yaml::Value::String(s) => serde_json::Value::String(s.clone()),
+        serde_yaml::Value::Sequence(seq) => {
+            serde_json::Value::Array(seq.iter().map(yaml_to_json).collect())
+        }
+        serde_yaml::Value::Mapping(map) => {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), yaml_to_json(v))))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        serde_yaml::Value::Tagged(tagged) => yaml_to_json(&tagged.value),
+    }
+}
+
+/// Convert a map of YAML values to a map of JSON values.
+pub fn yaml_to_json_map(
+    map: &HashMap<String, serde_yaml::Value>,
+) -> HashMap<String, serde_json::Value> {
+    map.iter()
+        .map(|(k, v)| (k.clone(), yaml_to_json(v)))
+        .collect()
 }
 
 // =============================================================================
@@ -1523,6 +1574,7 @@ mod tests {
             fields: vec![],
             falsepositives: vec![],
             custom_attributes,
+            custom_rule_attributes: HashMap::new(),
         }
     }
 
@@ -1553,6 +1605,66 @@ mod tests {
         let event = Event::from_value(&ev);
         let result = evaluate_rule(&compiled, &event).unwrap();
         assert!(result.event.is_none());
+    }
+
+    #[test]
+    fn test_custom_rule_attributes_propagate_to_match_result() {
+        let yaml = r#"
+title: Rule With Custom Attrs
+logsource:
+    category: test
+detection:
+    selection:
+        action: login
+    condition: selection
+level: medium
+my_custom_field: some_value
+severity_score: 42
+"#;
+        let collection = rsigma_parser::parse_sigma_yaml(yaml).unwrap();
+        let rule = &collection.rules[0];
+
+        let compiled = compile_rule(rule).unwrap();
+
+        // Custom rule attributes should be on the compiled rule
+        assert_eq!(
+            compiled.custom_rule_attributes.get("my_custom_field"),
+            Some(&serde_json::Value::String("some_value".to_string()))
+        );
+        assert_eq!(
+            compiled.custom_rule_attributes.get("severity_score"),
+            Some(&serde_json::json!(42))
+        );
+
+        // Standard fields should NOT be in custom_rule_attributes
+        assert!(!compiled.custom_rule_attributes.contains_key("title"));
+        assert!(!compiled.custom_rule_attributes.contains_key("level"));
+
+        // Match the rule and verify attributes propagate to MatchResult
+        let ev = json!({"action": "login"});
+        let event = Event::from_value(&ev);
+        let result = evaluate_rule(&compiled, &event).unwrap();
+
+        assert_eq!(
+            result.custom_rule_attributes.get("my_custom_field"),
+            Some(&serde_json::Value::String("some_value".to_string()))
+        );
+        assert_eq!(
+            result.custom_rule_attributes.get("severity_score"),
+            Some(&serde_json::json!(42))
+        );
+    }
+
+    #[test]
+    fn test_empty_custom_rule_attributes() {
+        let rule = make_test_sigma_rule("No Custom Attrs", HashMap::new());
+        let compiled = compile_rule(&rule).unwrap();
+        assert!(compiled.custom_rule_attributes.is_empty());
+
+        let ev = json!({"action": "login"});
+        let event = Event::from_value(&ev);
+        let result = evaluate_rule(&compiled, &event).unwrap();
+        assert!(result.custom_rule_attributes.is_empty());
     }
 }
 

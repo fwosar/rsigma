@@ -1,5 +1,7 @@
 //! Match result types for rule evaluation.
 
+use std::collections::HashMap;
+
 use rsigma_parser::Level;
 use serde::Serialize;
 
@@ -25,6 +27,10 @@ pub struct MatchResult {
     /// `rsigma.include_event` custom attribute is set to `"true"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<serde_json::Value>,
+    /// Custom rule attributes parsed from the original Sigma rule YAML.
+    /// Contains any non-standard top-level fields from the rule definition.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
 }
 
 /// A specific field match within a detection.

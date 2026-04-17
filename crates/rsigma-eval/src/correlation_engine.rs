@@ -242,6 +242,10 @@ pub struct CorrelationResult {
     /// Contains up to `max_correlation_events` timestamp + optional ID pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_refs: Option<Vec<EventRef>>,
+    /// Custom rule attributes from the original Sigma correlation rule YAML.
+    /// Contains any non-standard top-level fields from the rule definition.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
 }
 
 // =============================================================================
@@ -954,6 +958,7 @@ impl CorrelationEngine {
                     timespan_secs: timespan,
                     events,
                     event_refs,
+                    custom_rule_attributes: corr.custom_rule_attributes.clone(),
                 };
                 out.push(result);
 
@@ -1057,6 +1062,7 @@ impl CorrelationEngine {
                         // over correlation results, not raw events)
                         events: None,
                         event_refs: None,
+                        custom_rule_attributes: corr.custom_rule_attributes.clone(),
                     });
                 }
             }
