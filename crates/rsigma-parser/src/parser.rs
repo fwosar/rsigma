@@ -236,6 +236,11 @@ fn parse_detection_rule(value: &Value) -> Result<SigmaRule> {
         .transpose()?
         .unwrap_or_default();
 
+    // Custom attributes (rsigma.* extension keys) — mirrors pySigma's
+    // `SigmaRule.custom_attributes`. Parsed from the top-level `custom_attributes`
+    // mapping; pipeline transformations may also populate this field.
+    let custom_attributes = parse_custom_attributes(m);
+
     // Collect custom rule attributes: any top-level key not in the standard schema
     let standard_rule_keys: &[&str] = &[
         "title",
@@ -257,6 +262,7 @@ fn parse_detection_rule(value: &Value) -> Result<SigmaRule> {
         "level",
         "tags",
         "scope",
+        "custom_attributes",
     ];
 
     let custom_rule_attributes: HashMap<String, Value> = m
@@ -291,9 +297,24 @@ fn parse_detection_rule(value: &Value) -> Result<SigmaRule> {
         level: get_str(m, "level").and_then(|s| s.parse().ok()),
         tags: get_str_list(m, "tags"),
         scope: get_str_list(m, "scope"),
-        custom_attributes: HashMap::new(),
+        custom_attributes,
         custom_rule_attributes,
     })
+}
+
+/// Parse the top-level `custom_attributes:` mapping (string → string).
+///
+/// Non-mapping values, non-string keys, and non-string values are ignored.
+/// Mirrors the behavior described on `SigmaRule.custom_attributes` /
+/// `CorrelationRule.custom_attributes`.
+fn parse_custom_attributes(m: &serde_yaml::Mapping) -> HashMap<String, String> {
+    match m.get(val_key("custom_attributes")) {
+        Some(Value::Mapping(attrs)) => attrs
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+            .collect(),
+        _ => HashMap::new(),
+    }
 }
 
 // =============================================================================
@@ -593,15 +614,7 @@ fn parse_correlation_rule(value: &Value) -> Result<CorrelationRule> {
     let aliases = parse_correlation_aliases(corr);
 
     // Custom attributes (rsigma.* extension keys)
-    let custom_attributes = if let Some(Value::Mapping(attrs)) = m.get(val_key("custom_attributes"))
-    {
-        attrs
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let custom_attributes = parse_custom_attributes(m);
 
     // Collect custom correlation rule attributes: any top-level key not in the standard schema
     // Top-level keys from the Sigma correlation-rules JSON schema plus keys this
@@ -2009,6 +2022,40 @@ level: low
         let collection = parse_sigma_yaml(yaml).unwrap();
         let rule = &collection.rules[0];
         assert!(rule.custom_rule_attributes.is_empty());
+        assert!(rule.custom_attributes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_detection_rule_custom_attributes() {
+        let yaml = r#"
+title: Rule With Custom Attrs
+custom_attributes:
+    rsigma.suppress: 5m
+    rsigma.action: reset
+logsource:
+    category: test
+detection:
+    selection:
+        field: value
+    condition: selection
+level: low
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        let rule = &collection.rules[0];
+        assert_eq!(
+            rule.custom_attributes.get("rsigma.suppress"),
+            Some(&"5m".to_string())
+        );
+        assert_eq!(
+            rule.custom_attributes.get("rsigma.action"),
+            Some(&"reset".to_string())
+        );
+        // Reserved key — must not leak into custom_rule_attributes
+        assert!(
+            !rule
+                .custom_rule_attributes
+                .contains_key("custom_attributes")
+        );
     }
 
     #[test]

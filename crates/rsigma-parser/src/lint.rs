@@ -595,6 +595,7 @@ const KNOWN_KEYS_DETECTION: &[&str] = &[
     "falsepositives",
     "level",
     "scope",
+    "custom_attributes",
 ];
 
 /// Extra top-level keys valid for correlation rules.
