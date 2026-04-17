@@ -15,7 +15,7 @@
 // Reference: pySigma conditions.py (pyparsing infix_notation)
 // =============================================================================
 
-WHITESPACE = _{ " " | "\t" }
+WHITESPACE = _{ " " | "\t" | "\n" }
 
 // Entry point
 condition = { SOI ~ expr ~ EOI }
