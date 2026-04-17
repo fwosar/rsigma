@@ -8,6 +8,7 @@
 //! from each `FieldSpec` and produces the appropriate `CompiledMatcher` variant.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use base64::Engine as Base64Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -45,7 +46,8 @@ pub struct CompiledRule {
     pub include_event: bool,
     /// Custom rule attributes from the original Sigma rule YAML.
     /// Non-standard top-level fields are propagated to match results.
-    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
+    /// Wrapped in `Arc` so that per-match cloning is a pointer bump.
+    pub custom_rule_attributes: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// A compiled detection definition.
@@ -207,7 +209,7 @@ pub fn compile_rule(rule: &SigmaRule) -> Result<CompiledRule> {
         .get("rsigma.include_event")
         .is_some_and(|v| v == "true");
 
-    let custom_rule_attributes = yaml_to_json_map(&rule.custom_rule_attributes);
+    let custom_rule_attributes = Arc::new(yaml_to_json_map(&rule.custom_rule_attributes));
 
     Ok(CompiledRule {
         title: rule.title.clone(),
@@ -869,7 +871,10 @@ fn yaml_to_json(value: &serde_yaml::Value) -> serde_json::Value {
             } else if let Some(u) = n.as_u64() {
                 serde_json::Value::Number(u.into())
             } else if let Some(f) = n.as_f64() {
-                serde_json::json!(f)
+                // NaN and Inf are not representable in JSON; fall back to null.
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
             } else {
                 serde_json::Value::Null
             }
@@ -890,7 +895,7 @@ fn yaml_to_json(value: &serde_yaml::Value) -> serde_json::Value {
 }
 
 /// Convert a map of YAML values to a map of JSON values.
-pub fn yaml_to_json_map(
+pub(crate) fn yaml_to_json_map(
     map: &HashMap<String, serde_yaml::Value>,
 ) -> HashMap<String, serde_json::Value> {
     map.iter()

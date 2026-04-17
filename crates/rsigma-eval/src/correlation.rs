@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as IoRead, Write as IoWrite};
+use std::sync::Arc;
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
@@ -59,7 +60,8 @@ pub struct CompiledCorrelation {
     /// `None` means use the engine default (`CorrelationConfig.max_correlation_events`).
     pub max_events: Option<usize>,
     /// Custom rule attributes from the original Sigma correlation rule YAML.
-    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
+    /// Wrapped in `Arc` so that per-match cloning is a pointer bump.
+    pub custom_rule_attributes: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// A group-by field, potentially aliased per referenced rule.
@@ -853,7 +855,7 @@ pub fn compile_correlation(rule: &CorrelationRule) -> Result<CompiledCorrelation
         .get("rsigma.max_correlation_events")
         .and_then(|v| v.parse::<usize>().ok());
 
-    let custom_rule_attributes = crate::compiler::yaml_to_json_map(&rule.custom_rule_attributes);
+    let custom_rule_attributes = Arc::new(crate::compiler::yaml_to_json_map(&rule.custom_rule_attributes));
 
     Ok(CompiledCorrelation {
         id: rule.id.clone(),

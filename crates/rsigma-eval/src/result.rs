@@ -1,6 +1,7 @@
 //! Match result types for rule evaluation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rsigma_parser::Level;
 use serde::Serialize;
@@ -29,8 +30,13 @@ pub struct MatchResult {
     pub event: Option<serde_json::Value>,
     /// Custom rule attributes parsed from the original Sigma rule YAML.
     /// Contains any non-standard top-level fields from the rule definition.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub custom_rule_attributes: HashMap<String, serde_json::Value>,
+    /// Wrapped in `Arc` so that per-match cloning is a pointer bump.
+    #[serde(skip_serializing_if = "arc_map_is_empty")]
+    pub custom_rule_attributes: Arc<HashMap<String, serde_json::Value>>,
+}
+
+fn arc_map_is_empty(map: &Arc<HashMap<String, serde_json::Value>>) -> bool {
+    map.is_empty()
 }
 
 /// A specific field match within a detection.
