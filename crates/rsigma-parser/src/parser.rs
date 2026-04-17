@@ -1825,4 +1825,39 @@ level: low
             Some("process_creation".to_string())
         );
     }
+
+    #[test]
+    fn test_line_feed_in_condition() {
+        let yaml = r#"
+title: Line Feed Condition rule
+logsource:
+    product: windows
+detection:
+    selection:
+        Payload: 'data'
+    replication_guid: 
+        Payload: 'guid'
+    filter_machine_account: 
+        Payload: 'value'
+    filter_known_service_accounts: 
+        Payload: 'value'
+    filter_msol_prefix: 
+        Payload: 'value'
+    filter_nt_authority_prefix: 
+        Payload: 'value'
+    condition: >-
+        selection and replication_guid
+        and not (filter_machine_account or filter_known_service_accounts
+                or filter_msol_prefix or filter_nt_authority_prefix)
+level: medium
+"#;
+        let collection = parse_sigma_yaml(yaml).unwrap();
+        assert!(
+            collection.errors.is_empty(),
+            "errors: {:?}",
+            collection.errors
+        );
+        assert_eq!(collection.rules.len(), 1);
+    }
+
 }
