@@ -855,7 +855,9 @@ pub fn compile_correlation(rule: &CorrelationRule) -> Result<CompiledCorrelation
         .get("rsigma.max_correlation_events")
         .and_then(|v| v.parse::<usize>().ok());
 
-    let custom_rule_attributes = Arc::new(crate::compiler::yaml_to_json_map(&rule.custom_rule_attributes));
+    let custom_rule_attributes = Arc::new(crate::compiler::yaml_to_json_map(
+        &rule.custom_rule_attributes,
+    ));
 
     Ok(CompiledCorrelation {
         id: rule.id.clone(),
