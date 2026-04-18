@@ -243,9 +243,6 @@ pub struct CorrelationResult {
     /// Contains up to `max_correlation_events` timestamp + optional ID pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_refs: Option<Vec<EventRef>>,
-    /// Custom rule attributes from the original Sigma correlation rule YAML.
-    /// Contains any non-standard top-level fields from the rule definition.
-    /// Wrapped in `Arc` so that per-match cloning is a pointer bump.
     /// Custom attributes from the original Sigma correlation rule (merged
     /// view of arbitrary top-level keys, the `custom_attributes:` block, and
     /// any pipeline-applied overrides).
