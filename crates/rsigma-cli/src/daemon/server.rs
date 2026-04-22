@@ -9,22 +9,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rsigma_eval::{CorrelationConfig, Pipeline, ProcessResult};
+use rsigma_runtime::{
+    FileSink, LogProcessor, MetricsHook, RuntimeEngine, Sink, StdinSource, StdoutSink, spawn_source,
+};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use super::engine::{SharedEngine, process_batch_lines};
 use super::health::HealthState;
 use super::metrics::Metrics;
 use super::reload;
-use super::state::DaemonEngine;
 use super::store::SqliteStateStore;
-use super::streaming::{self, FileSink, Sink, StdinSource, StdoutSink};
 use crate::EventFilter;
 
 #[derive(Clone)]
 struct AppState {
-    engine: SharedEngine,
-    metrics: Metrics,
+    processor: Arc<LogProcessor>,
+    metrics: Arc<Metrics>,
     health: HealthState,
     reload_tx: mpsc::Sender<()>,
     start_time: Instant,
@@ -51,7 +51,7 @@ pub struct DaemonConfig {
 }
 
 pub async fn run_daemon(config: DaemonConfig) {
-    let metrics = Metrics::new();
+    let metrics = Arc::new(Metrics::new());
     let health = HealthState::new();
 
     // Open SQLite state store if configured
@@ -64,46 +64,42 @@ pub async fn run_daemon(config: DaemonConfig) {
         Arc::new(store)
     });
 
-    let daemon_engine = DaemonEngine::new(
+    let engine = RuntimeEngine::new(
         config.rules_path.clone(),
         config.pipelines.clone(),
         config.corr_config.clone(),
         config.include_event,
     );
-    let shared_engine: SharedEngine = Arc::new(std::sync::Mutex::new(daemon_engine));
+    let processor = Arc::new(LogProcessor::new(engine, metrics.clone()));
 
     // Initial rule load
-    {
-        let mut engine = shared_engine.lock().unwrap();
-        match engine.load_rules() {
-            Ok(stats) => {
-                tracing::info!(
-                    detection_rules = stats.detection_rules,
-                    correlation_rules = stats.correlation_rules,
-                    path = %config.rules_path.display(),
-                    "Rules loaded"
-                );
-                metrics
-                    .detection_rules_loaded
-                    .set(stats.detection_rules as i64);
-                metrics
-                    .correlation_rules_loaded
-                    .set(stats.correlation_rules as i64);
-                health.set_ready(true);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to load initial rules");
-                std::process::exit(1);
-            }
+    match processor.reload_rules() {
+        Ok(stats) => {
+            tracing::info!(
+                detection_rules = stats.detection_rules,
+                correlation_rules = stats.correlation_rules,
+                path = %config.rules_path.display(),
+                "Rules loaded"
+            );
+            metrics
+                .detection_rules_loaded
+                .set(stats.detection_rules as i64);
+            metrics
+                .correlation_rules_loaded
+                .set(stats.correlation_rules as i64);
+            health.set_ready(true);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to load initial rules");
+            std::process::exit(1);
         }
     }
 
-    // Restore correlation state from SQLite (after rules are loaded, lock released)
+    // Restore correlation state from SQLite (after rules are loaded)
     if let Some(ref store) = state_store {
         match store.load().await {
             Ok(Some(snapshot)) => {
-                let mut engine = shared_engine.lock().unwrap();
-                if engine.import_state(&snapshot) {
+                if processor.import_state(&snapshot) {
                     let entries = snapshot.windows.values().map(|g| g.len()).sum::<usize>();
                     tracing::info!(
                         state_entries = entries,
@@ -150,7 +146,7 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
 
     let app_state = AppState {
-        engine: shared_engine.clone(),
+        processor: processor.clone(),
         metrics: metrics.clone(),
         health: health.clone(),
         reload_tx: reload_tx.clone(),
@@ -182,8 +178,8 @@ pub async fn run_daemon(config: DaemonConfig) {
         reload::sighup_listener(sighup_tx).await;
     });
 
-    // Spawn reload handler
-    let reload_engine = shared_engine.clone();
+    // Spawn reload handler — uses LogProcessor::reload_rules for atomic hot-reload
+    let reload_processor = processor.clone();
     let reload_metrics = metrics.clone();
     let reload_health = health.clone();
     tokio::spawn(async move {
@@ -195,13 +191,12 @@ pub async fn run_daemon(config: DaemonConfig) {
             reload_metrics.reloads_total.inc();
             tracing::info!("Reloading rules...");
 
-            let mut engine = reload_engine.lock().unwrap();
-            match engine.load_rules() {
+            match reload_processor.reload_rules() {
                 Ok(stats) => {
                     tracing::info!(
                         detection_rules = stats.detection_rules,
                         correlation_rules = stats.correlation_rules,
-                        path = %engine.rules_path().display(),
+                        path = %reload_processor.rules_path().display(),
                         "Rules reloaded"
                     );
                     reload_metrics
@@ -222,7 +217,7 @@ pub async fn run_daemon(config: DaemonConfig) {
 
     // Spawn periodic state saver
     if let Some(ref store) = state_store {
-        let save_engine = shared_engine.clone();
+        let save_processor = processor.clone();
         let save_store = store.clone();
         let save_interval_secs = config.state_save_interval;
         tokio::spawn(async move {
@@ -231,11 +226,7 @@ pub async fn run_daemon(config: DaemonConfig) {
             interval.tick().await; // skip first immediate tick
             loop {
                 interval.tick().await;
-                let snapshot = {
-                    let engine = save_engine.lock().unwrap();
-                    engine.export_state()
-                };
-                if let Some(snapshot) = snapshot {
+                if let Some(snapshot) = save_processor.export_state() {
                     if let Err(e) = save_store.save(&snapshot).await {
                         tracing::warn!(error = %e, "Failed to save periodic state snapshot");
                     } else {
@@ -247,22 +238,20 @@ pub async fn run_daemon(config: DaemonConfig) {
     }
 
     // --- Streaming pipeline: source -> engine -> sink ---
-    // event_tx / event_rx were created above (before AppState) so the HTTP
-    // handler can share event_tx when --input is http.
-
     let (sink_tx, mut sink_rx) = mpsc::channel::<ProcessResult>(buffer_size);
 
-    // Select source based on --input flag. Store the source handle so we can
-    // abort it on shutdown to trigger graceful drain.
+    // Select source based on --input flag
     let source_handle: Option<tokio::task::JoinHandle<()>> = match config.input.as_str() {
         "stdin" | "stdin://" => {
-            let h = streaming::spawn_source(StdinSource::new(), event_tx, Some(metrics.clone()));
+            let h = spawn_source(
+                StdinSource::new(),
+                event_tx,
+                Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+            );
             tracing::info!(input = "stdin", "Event source started");
             Some(h)
         }
         "http" => {
-            // Events arrive via POST /api/v1/events; event_tx is held by AppState.
-            // Drop the local event_tx so the channel closes when AppState is dropped.
             drop(event_tx);
             tracing::info!(input = "http", "Event source started (POST /api/v1/events)");
             None
@@ -270,9 +259,13 @@ pub async fn run_daemon(config: DaemonConfig) {
         #[cfg(feature = "daemon-nats")]
         input if input.starts_with("nats://") => {
             let (url, subject) = parse_nats_url(input);
-            match streaming::NatsSource::connect(&url, &subject).await {
+            match rsigma_runtime::NatsSource::connect(&url, &subject).await {
                 Ok(source) => {
-                    let h = streaming::spawn_source(source, event_tx, Some(metrics.clone()));
+                    let h = spawn_source(
+                        source,
+                        event_tx,
+                        Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+                    );
                     tracing::info!(url = url, subject = subject, "NATS source started");
                     Some(h)
                 }
@@ -292,12 +285,12 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
 
     // Engine task: reads events, evaluates rules, sends results to sink channel.
-    // Supports micro-batching: collects up to batch_size events per lock acquisition.
-    let engine_shared = shared_engine.clone();
+    let engine_processor = processor.clone();
     let engine_metrics = metrics.clone();
     let event_filter = config.event_filter.clone();
     let batch_size = config.batch_size;
     let mut engine_handle = tokio::spawn(async move {
+        let filter_fn = |v: &serde_json::Value| crate::apply_event_filter(v, &event_filter);
         loop {
             let pipeline_start = std::time::Instant::now();
 
@@ -305,40 +298,30 @@ pub async fn run_daemon(config: DaemonConfig) {
                 Some(line) => line,
                 None => break,
             };
-            engine_metrics.input_queue_depth.dec();
+            engine_metrics.on_input_queue_depth_change(-1);
 
             let mut batch = Vec::with_capacity(batch_size.min(64));
             batch.push(first);
             while batch.len() < batch_size {
                 match event_rx.try_recv() {
                     Ok(line) => {
-                        engine_metrics.input_queue_depth.dec();
+                        engine_metrics.on_input_queue_depth_change(-1);
                         batch.push(line);
                     }
                     Err(_) => break,
                 }
             }
-            engine_metrics
-                .batch_size_histogram
-                .observe(batch.len() as f64);
+            engine_metrics.observe_batch_size(batch.len() as u64);
 
-            let results: Vec<ProcessResult> = {
-                let mut engine = engine_shared.lock().unwrap();
-                let results =
-                    process_batch_lines(&mut engine, &batch, &engine_metrics, &event_filter);
-                let stats = engine.stats();
-                engine_metrics
-                    .correlation_state_entries
-                    .set(stats.state_entries as i64);
-                results
-            };
+            let results: Vec<ProcessResult> =
+                engine_processor.process_batch_lines(&batch, &filter_fn);
 
             let mut shutdown = false;
             for result in results {
                 if result.detections.is_empty() && result.correlations.is_empty() {
                     continue;
                 }
-                engine_metrics.output_queue_depth.inc();
+                engine_metrics.on_output_queue_depth_change(1);
                 if sink_tx.send(result).await.is_err() {
                     tracing::debug!("Sink channel closed, engine shutting down");
                     shutdown = true;
@@ -346,9 +329,7 @@ pub async fn run_daemon(config: DaemonConfig) {
                 }
             }
 
-            engine_metrics
-                .pipeline_latency
-                .observe(pipeline_start.elapsed().as_secs_f64());
+            engine_metrics.observe_pipeline_latency(pipeline_start.elapsed().as_secs_f64());
 
             if shutdown {
                 break;
@@ -357,7 +338,7 @@ pub async fn run_daemon(config: DaemonConfig) {
         tracing::info!("Event source exhausted, engine shutting down");
     });
 
-    // Build sink(s) from --output flags. Multiple outputs produce a FanOut.
+    // Build sink(s) from --output flags
     let pretty = config.pretty;
     let output_specs = if config.output.is_empty() {
         vec!["stdout".to_string()]
@@ -380,7 +361,7 @@ pub async fn run_daemon(config: DaemonConfig) {
     let sink_handle = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(result) = sink_rx.recv().await {
-            sink_metrics.output_queue_depth.dec();
+            sink_metrics.on_output_queue_depth_change(-1);
             if let Err(e) = sink.send(&result).await {
                 tracing::warn!(error = %e, "Error writing to sink");
             }
@@ -405,8 +386,6 @@ pub async fn run_daemon(config: DaemonConfig) {
     if shutdown_triggered {
         tracing::info!("Shutdown signal received, draining pipeline...");
 
-        // Abort the source task to stop feeding new events. Dropping its
-        // event_tx clone closes event_rx once the engine drains buffered events.
         if let Some(h) = source_handle {
             h.abort();
         }
@@ -422,21 +401,16 @@ pub async fn run_daemon(config: DaemonConfig) {
             );
         }
     } else {
-        // Engine exited naturally (source exhausted). Drain the sink.
         let _ = sink_handle.await;
     }
 
     // Save state on shutdown
-    if let Some(ref store) = state_store {
-        let snapshot = {
-            let engine = shared_engine.lock().unwrap();
-            engine.export_state()
-        };
-        if let Some(snapshot) = snapshot {
-            match store.save(&snapshot).await {
-                Ok(()) => tracing::info!("Correlation state saved to database on shutdown"),
-                Err(e) => tracing::error!(error = %e, "Failed to save state on shutdown"),
-            }
+    if let Some(ref store) = state_store
+        && let Some(snapshot) = processor.export_state()
+    {
+        match store.save(&snapshot).await {
+            Ok(()) => tracing::info!("Correlation state saved to database on shutdown"),
+            Err(e) => tracing::error!(error = %e, "Failed to save state on shutdown"),
         }
     }
 }
@@ -464,7 +438,7 @@ async fn build_sink(spec: &str, pretty: bool) -> Sink {
     #[cfg(feature = "daemon-nats")]
     if spec.starts_with("nats://") {
         let (url, subject) = parse_nats_url(spec);
-        return match streaming::NatsSink::connect(&url, &subject).await {
+        return match rsigma_runtime::NatsSink::connect(&url, &subject).await {
             Ok(nats_sink) => {
                 tracing::info!(url = url, subject = subject, "NATS sink started");
                 Sink::Nats(nats_sink)
@@ -547,12 +521,11 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn list_rules(State(state): State<AppState>) -> impl IntoResponse {
-    let engine = state.engine.lock().unwrap();
-    let stats = engine.stats();
+    let stats = state.processor.stats();
     Json(serde_json::json!({
         "detection_rules": stats.detection_rules,
         "correlation_rules": stats.correlation_rules,
-        "rules_path": engine.rules_path().display().to_string(),
+        "rules_path": state.processor.rules_path().display().to_string(),
     }))
 }
 
@@ -569,8 +542,7 @@ struct StatusResponse {
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let engine = state.engine.lock().unwrap();
-    let stats = engine.stats();
+    let stats = state.processor.stats();
     let resp = StatusResponse {
         status: if state.health.is_ready() {
             "running".to_string()

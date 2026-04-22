@@ -135,9 +135,67 @@ impl LogProcessor {
         line_results
     }
 
+    /// Reload rules without blocking in-flight event processing.
+    ///
+    /// Builds a fresh `RuntimeEngine` with the same configuration as the
+    /// current one, loads rules into it, imports the old engine's correlation
+    /// state, and atomically swaps. In-flight batches that already hold an
+    /// `Arc` to the old engine finish undisturbed.
+    pub fn reload_rules(&self) -> Result<crate::engine::EngineStats, String> {
+        let (old_state, rules_path, pipelines, corr_config, include_event) = {
+            let snapshot = self.engine.load();
+            let old = snapshot.lock().unwrap();
+            (
+                old.export_state(),
+                old.rules_path().to_path_buf(),
+                old.pipelines().to_vec(),
+                old.corr_config().clone(),
+                old.include_event(),
+            )
+        };
+
+        let mut new_engine = RuntimeEngine::new(rules_path, pipelines, corr_config, include_event);
+        let stats = new_engine.load_rules()?;
+
+        if let Some(state) = old_state {
+            new_engine.import_state(&state);
+        }
+
+        self.swap_engine(new_engine);
+        Ok(stats)
+    }
+
+    /// Return the rules path from the current engine.
+    pub fn rules_path(&self) -> std::path::PathBuf {
+        let snapshot = self.engine.load();
+        let engine = snapshot.lock().unwrap();
+        engine.rules_path().to_path_buf()
+    }
+
     /// Return a reference to the metrics hook.
     pub fn metrics(&self) -> &dyn MetricsHook {
         &*self.metrics
+    }
+
+    /// Export correlation state from the current engine.
+    pub fn export_state(&self) -> Option<rsigma_eval::CorrelationSnapshot> {
+        let snapshot = self.engine.load();
+        let engine = snapshot.lock().unwrap();
+        engine.export_state()
+    }
+
+    /// Import correlation state into the current engine.
+    pub fn import_state(&self, snapshot: &rsigma_eval::CorrelationSnapshot) -> bool {
+        let guard = self.engine.load();
+        let mut engine = guard.lock().unwrap();
+        engine.import_state(snapshot)
+    }
+
+    /// Return summary statistics about the current engine.
+    pub fn stats(&self) -> crate::engine::EngineStats {
+        let snapshot = self.engine.load();
+        let engine = snapshot.lock().unwrap();
+        engine.stats()
     }
 }
 

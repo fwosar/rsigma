@@ -136,6 +136,21 @@ impl RuntimeEngine {
         &self.rules_path
     }
 
+    /// Return the configured processing pipelines.
+    pub fn pipelines(&self) -> &[Pipeline] {
+        &self.pipelines
+    }
+
+    /// Return the correlation configuration.
+    pub fn corr_config(&self) -> &CorrelationConfig {
+        &self.corr_config
+    }
+
+    /// Whether detection results include the matched event.
+    pub fn include_event(&self) -> bool {
+        self.include_event
+    }
+
     /// Export correlation state as a serializable snapshot.
     /// Returns `None` if the engine is detection-only (no correlation state to persist).
     pub fn export_state(&self) -> Option<CorrelationSnapshot> {

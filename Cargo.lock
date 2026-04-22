@@ -2614,6 +2614,7 @@ dependencies = [
  "prometheus",
  "rsigma-eval",
  "rsigma-parser",
+ "rsigma-runtime",
  "rusqlite",
  "serde",
  "serde_json",
