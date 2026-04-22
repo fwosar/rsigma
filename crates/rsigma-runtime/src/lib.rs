@@ -55,7 +55,7 @@ pub use error::RuntimeError;
 pub use input::{EventInputDecoded, InputFormat, parse_line};
 pub use io::{EventSource, FileSink, Sink, StdinSource, StdoutSink, spawn_source};
 pub use metrics::{MetricsHook, NoopMetrics};
-pub use processor::LogProcessor;
+pub use processor::{EventFilter, LogProcessor};
 
 pub use rsigma_eval::ProcessResult;
 
