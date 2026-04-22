@@ -96,6 +96,9 @@ fn build_event_from_message(parsed: &Message<&str>) -> EventInputDecoded {
 }
 
 /// Inject syslog header fields into a JSON object (for embedded-JSON case).
+///
+/// Includes all fields that the KvEvent path extracts: timestamp, hostname,
+/// appname, procid, msgid, facility, severity, and RFC 5424 structured data.
 fn inject_syslog_headers(
     parsed: &Message<&str>,
     obj: &mut serde_json::Map<String, serde_json::Value>,
@@ -112,6 +115,14 @@ fn inject_syslog_headers(
         obj.entry("syslog_appname")
             .or_insert_with(|| serde_json::Value::String(app.to_string()));
     }
+    if let Some(pid) = &parsed.procid {
+        obj.entry("syslog_procid")
+            .or_insert_with(|| serde_json::Value::String(pid.to_string()));
+    }
+    if let Some(mid) = &parsed.msgid {
+        obj.entry("syslog_msgid")
+            .or_insert_with(|| serde_json::Value::String(mid.to_string()));
+    }
     if let Some(facility) = &parsed.facility {
         obj.entry("syslog_facility")
             .or_insert_with(|| serde_json::Value::String(format!("{facility:?}")));
@@ -119,6 +130,15 @@ fn inject_syslog_headers(
     if let Some(severity) = &parsed.severity {
         obj.entry("syslog_severity")
             .or_insert_with(|| serde_json::Value::String(format!("{severity:?}")));
+    }
+
+    // RFC 5424 structured data parameters.
+    for elem in &parsed.structured_data {
+        for (key, val) in elem.params() {
+            let prefixed_key = format!("sd.{}.{}", elem.id, key);
+            obj.entry(prefixed_key)
+                .or_insert_with(|| serde_json::Value::String(val));
+        }
     }
 }
 
@@ -165,11 +185,13 @@ mod tests {
 
     #[test]
     fn syslog_wrapped_json() {
-        let line =
-            r#"<134>1 2024-01-15T10:30:00Z docker01 myapp - - - {"EventID": 1, "user": "admin"}"#;
+        let line = r#"<134>1 2024-01-15T10:30:00Z docker01 myapp 9876 MSGID1 - {"EventID": 1, "user": "admin"}"#;
         let decoded = parse_syslog(line, &SyslogConfig::default());
         assert!(decoded.get_field("EventID").is_some());
         assert!(decoded.get_field("user").is_some());
+        // Syslog headers should be merged into the JSON object.
+        assert!(decoded.get_field("syslog_hostname").is_some());
+        assert!(decoded.get_field("syslog_appname").is_some());
     }
 
     #[test]

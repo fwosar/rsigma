@@ -576,8 +576,9 @@ async fn trigger_reload(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Accept NDJSON events via HTTP POST for processing.
-/// Each non-empty line in the request body is treated as a separate JSON event.
+/// Accept events via HTTP POST for processing.
+/// Each non-empty line in the request body is parsed using the configured
+/// `--input-format` and forwarded to the engine.
 async fn ingest_events(State(state): State<AppState>, body: String) -> Response {
     let event_tx = match &state.event_tx {
         Some(tx) => tx,

@@ -1685,7 +1685,9 @@ fn parse_input_format(format_str: &str, syslog_tz: &str) -> rsigma_runtime::Inpu
     let tz_secs = parse_tz_offset(syslog_tz);
 
     match format_str {
-        "auto" => InputFormat::Auto,
+        "auto" => InputFormat::Auto(SyslogConfig {
+            default_tz_offset_secs: tz_secs,
+        }),
         "json" => InputFormat::Json,
         "syslog" => InputFormat::Syslog(SyslogConfig {
             default_tz_offset_secs: tz_secs,

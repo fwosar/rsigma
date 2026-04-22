@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use rsigma_eval::{JsonEvent, ProcessResult};
+use rsigma_eval::{Event, JsonEvent, ProcessResult};
 
 use crate::engine::RuntimeEngine;
 use crate::input::{EventInputDecoded, InputFormat, parse_line};
@@ -155,51 +155,29 @@ impl LogProcessor {
         let mut decoded_events: Vec<(usize, EventInputDecoded)> = Vec::with_capacity(batch.len());
 
         for (line_idx, line) in batch.iter().enumerate() {
-            match format {
-                InputFormat::Json | InputFormat::Auto => {
-                    // For JSON/auto with event_filter: parse as JSON first to apply filter.
-                    if let Some(filter) = event_filter {
-                        if let Some(EventInputDecoded::Json(_)) = parse_line(line, format) {
-                            // Re-parse as raw JSON to apply filter.
-                            match serde_json::from_str::<serde_json::Value>(line) {
-                                Ok(value) => {
-                                    let payloads = filter(&value);
-                                    for payload in payloads {
-                                        decoded_events.push((
-                                            line_idx,
-                                            EventInputDecoded::Json(JsonEvent::owned(payload)),
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    self.metrics.on_parse_error();
-                                    tracing::debug!(error = %e, "Parse error on input");
-                                }
-                            }
-                        } else if let Some(decoded) = parse_line(line, format) {
-                            // Auto-detect fell through to syslog/plain — no filter.
-                            decoded_events.push((line_idx, decoded));
-                        } else {
-                            self.metrics.on_parse_error();
-                            tracing::debug!("Failed to parse input line");
-                        }
-                    } else if let Some(decoded) = parse_line(line, format) {
-                        decoded_events.push((line_idx, decoded));
-                    } else {
-                        self.metrics.on_parse_error();
-                        tracing::debug!("Failed to parse input line");
-                    }
+            let Some(decoded) = parse_line(line, format) else {
+                if !line.trim().is_empty() {
+                    self.metrics.on_parse_error();
+                    tracing::debug!("Failed to parse input line");
                 }
-                _ => {
-                    // Non-JSON formats: one event per line, no filter.
-                    if let Some(decoded) = parse_line(line, format) {
-                        decoded_events.push((line_idx, decoded));
-                    } else {
-                        self.metrics.on_parse_error();
-                        tracing::debug!("Failed to parse input line");
-                    }
+                continue;
+            };
+
+            // For JSON events with an event filter, apply the filter which
+            // may produce multiple payloads (e.g. `.records[]`).
+            if let Some(filter) = event_filter
+                && let EventInputDecoded::Json(ref json_event) = decoded
+            {
+                let json_value = json_event.to_json();
+                let payloads = filter(&json_value);
+                for payload in payloads {
+                    decoded_events
+                        .push((line_idx, EventInputDecoded::Json(JsonEvent::owned(payload))));
                 }
+                continue;
             }
+
+            decoded_events.push((line_idx, decoded));
         }
 
         if decoded_events.is_empty() {
@@ -817,7 +795,7 @@ detection:
         );
 
         let batch = vec![r#"{"EventID": 1}"#.to_string()];
-        let results = proc.process_batch_with_format(&batch, &InputFormat::Auto, None);
+        let results = proc.process_batch_with_format(&batch, &InputFormat::default(), None);
         assert_eq!(results.len(), 1);
         assert!(!results[0].detections.is_empty());
     }

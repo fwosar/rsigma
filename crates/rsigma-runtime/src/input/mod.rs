@@ -5,7 +5,7 @@
 //! adapter to use, and [`parse_line`] is the main dispatch function.
 //!
 //! Always-on formats: JSON/GELF, syslog (RFC 3164/5424), plain text, auto-detect.
-//! Feature-gated formats: logfmt (`logfmt`), CEF (`cef`), EVTX (`evtx`).
+//! Feature-gated formats: logfmt (`logfmt`), CEF (`cef`).
 
 use std::borrow::Cow;
 
@@ -31,11 +31,11 @@ pub use auto::auto_detect;
 pub use plain::parse_plain;
 
 /// Selects which input format adapter to use for raw log lines.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputFormat {
-    /// Try JSON → syslog → plain (default).
-    #[default]
-    Auto,
+    /// Try JSON → syslog → plain (default). Carries a [`SyslogConfig`] that
+    /// applies when auto-detection selects the syslog path.
+    Auto(SyslogConfig),
     /// NDJSON / GELF.
     Json,
     /// Syslog RFC 3164 / 5424.
@@ -48,6 +48,12 @@ pub enum InputFormat {
     /// ArcSight Common Event Format (requires `cef` feature).
     #[cfg(feature = "cef")]
     Cef,
+}
+
+impl Default for InputFormat {
+    fn default() -> Self {
+        InputFormat::Auto(SyslogConfig::default())
+    }
 }
 
 /// A decoded event ready for Sigma rule evaluation.
@@ -97,13 +103,19 @@ impl Event for EventInputDecoded {
 
 /// Parse a raw log line using the specified format.
 ///
-/// Returns `None` if the line is empty or whitespace-only.
+/// Returns `None` if:
+/// - the line is empty or whitespace-only,
+/// - `InputFormat::Json` and the line is not valid JSON, or
+/// - `InputFormat::Cef` and the line is not valid CEF.
+///
+/// For `InputFormat::Auto`, invalid JSON falls through to syslog or plain
+/// text (never returns `None` for non-empty lines).
 pub fn parse_line(line: &str, format: &InputFormat) -> Option<EventInputDecoded> {
     if line.trim().is_empty() {
         return None;
     }
     Some(match format {
-        InputFormat::Auto => auto_detect(line),
+        InputFormat::Auto(syslog_config) => auto_detect(line, syslog_config),
         InputFormat::Json => parse_json(line)?,
         InputFormat::Syslog(config) => parse_syslog(line, config),
         InputFormat::Plain => parse_plain(line),

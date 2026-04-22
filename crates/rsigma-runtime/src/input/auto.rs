@@ -12,7 +12,10 @@
 use super::{EventInputDecoded, SyslogConfig, parse_json, parse_plain, parse_syslog};
 
 /// Auto-detect the format of a single line and parse it.
-pub fn auto_detect(line: &str) -> EventInputDecoded {
+///
+/// The `syslog_config` is used when the syslog path is selected (e.g. to
+/// honor `--syslog-tz` even in auto-detect mode).
+pub fn auto_detect(line: &str, syslog_config: &SyslogConfig) -> EventInputDecoded {
     // 1. Try JSON first (fast: just check if it starts with '{' or '[').
     let trimmed = line.trim_start();
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
@@ -23,7 +26,7 @@ pub fn auto_detect(line: &str) -> EventInputDecoded {
 
     // 2. Try syslog: if the line starts with '<' (priority), it's likely syslog.
     if trimmed.starts_with('<') {
-        let decoded = parse_syslog(line, &SyslogConfig::default());
+        let decoded = parse_syslog(line, syslog_config);
         // Check if syslog extracted meaningful fields (not just _raw).
         if has_syslog_fields(&decoded) {
             return decoded;
@@ -35,13 +38,13 @@ pub fn auto_detect(line: &str) -> EventInputDecoded {
 }
 
 /// Check if the syslog adapter extracted meaningful structured fields
-/// beyond just `_raw`.
+/// beyond just `_raw`. The syslog adapter never returns `Plain`, so only
+/// `Kv` and `Json` variants are possible here.
 fn has_syslog_fields(decoded: &EventInputDecoded) -> bool {
     match decoded {
         EventInputDecoded::Kv(kv) => kv.fields().iter().any(|(k, _)| k != "_raw"),
-        // If it produced a JsonEvent (embedded JSON), that's meaningful.
         EventInputDecoded::Json(_) => true,
-        EventInputDecoded::Plain(_) => false,
+        _ => false,
     }
 }
 
@@ -50,17 +53,23 @@ mod tests {
     use super::*;
     use rsigma_eval::Event;
 
+    fn cfg() -> SyslogConfig {
+        SyslogConfig::default()
+    }
+
     #[test]
     fn auto_detect_json() {
-        let decoded = auto_detect(r#"{"EventID": 1, "host": "web01"}"#);
+        let decoded = auto_detect(r#"{"EventID": 1, "host": "web01"}"#, &cfg());
         assert!(matches!(decoded, EventInputDecoded::Json(_)));
         assert!(decoded.get_field("EventID").is_some());
     }
 
     #[test]
     fn auto_detect_syslog() {
-        let decoded = auto_detect("<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick");
-        // Should detect as syslog, not plain.
+        let decoded = auto_detect(
+            "<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick",
+            &cfg(),
+        );
         assert!(
             matches!(
                 decoded,
@@ -72,14 +81,16 @@ mod tests {
 
     #[test]
     fn auto_detect_plain() {
-        let decoded = auto_detect("ERROR: something went wrong on server");
+        let decoded = auto_detect("ERROR: something went wrong on server", &cfg());
         assert!(matches!(decoded, EventInputDecoded::Plain(_)));
     }
 
     #[test]
     fn auto_detect_syslog_wrapped_json() {
-        let decoded = auto_detect(r#"<134>1 2024-01-15T10:30:00Z host app - - - {"key": "value"}"#);
-        // Should extract the embedded JSON.
+        let decoded = auto_detect(
+            r#"<134>1 2024-01-15T10:30:00Z host app - - - {"key": "value"}"#,
+            &cfg(),
+        );
         assert!(
             matches!(decoded, EventInputDecoded::Json(_)),
             "Expected embedded JSON to be extracted"
@@ -88,24 +99,36 @@ mod tests {
 
     #[test]
     fn auto_detect_invalid_json_falls_through() {
-        let decoded = auto_detect("{not valid json}");
-        // Doesn't start with '<' so not syslog either → plain.
+        let decoded = auto_detect("{not valid json}", &cfg());
         assert!(matches!(decoded, EventInputDecoded::Plain(_)));
     }
 
     #[test]
     fn mixed_format_batch() {
+        let c = cfg();
         let lines = [
             r#"{"EventID": 1}"#,
             "<34>Oct 11 22:14:15 host su: test",
             "plain log line",
         ];
-        let results: Vec<_> = lines.iter().map(|l| auto_detect(l)).collect();
+        let results: Vec<_> = lines.iter().map(|l| auto_detect(l, &c)).collect();
         assert!(matches!(results[0], EventInputDecoded::Json(_)));
         assert!(matches!(
             results[1],
             EventInputDecoded::Kv(_) | EventInputDecoded::Json(_)
         ));
         assert!(matches!(results[2], EventInputDecoded::Plain(_)));
+    }
+
+    #[test]
+    fn auto_detect_syslog_respects_config() {
+        let config = SyslogConfig {
+            default_tz_offset_secs: 5 * 3600,
+        };
+        let decoded = auto_detect("<34>Oct 11 22:14:15 mymachine su: test", &config);
+        assert!(matches!(
+            decoded,
+            EventInputDecoded::Kv(_) | EventInputDecoded::Json(_)
+        ));
     }
 }
