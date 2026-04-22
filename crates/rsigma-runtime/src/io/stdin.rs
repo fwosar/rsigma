@@ -2,12 +2,18 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::EventSource;
 
-/// Reads JSON events from stdin, one per line.
+/// Reads events from stdin, one per line.
 ///
 /// Uses `tokio::io::stdin()` with `AsyncBufReadExt::lines()` for fully async
 /// reading without a background blocking thread.
 pub struct StdinSource {
     lines: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+}
+
+impl Default for StdinSource {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StdinSource {

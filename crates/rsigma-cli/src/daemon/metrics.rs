@@ -1,6 +1,7 @@
 use prometheus::{
     Gauge, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, TextEncoder,
 };
+use rsigma_runtime::MetricsHook;
 
 #[derive(Clone)]
 pub struct Metrics {
@@ -113,13 +114,10 @@ impl Metrics {
         )
         .unwrap();
         let batch_size_histogram = Histogram::with_opts(
-            HistogramOpts::new(
-                "rsigma_batch_size",
-                "Number of events processed per engine lock acquisition",
-            )
-            .buckets(vec![
-                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0,
-            ]),
+            HistogramOpts::new("rsigma_batch_size", "Number of events processed per batch")
+                .buckets(vec![
+                    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0,
+                ]),
         )
         .unwrap();
 
@@ -193,5 +191,60 @@ impl Metrics {
         encoder
             .encode_to_string(&metric_families)
             .unwrap_or_default()
+    }
+}
+
+/// Bridge from rsigma-runtime's MetricsHook trait to the Prometheus-backed Metrics struct.
+impl MetricsHook for Metrics {
+    fn on_parse_error(&self) {
+        self.events_parse_errors.inc();
+    }
+
+    fn on_events_processed(&self, count: u64) {
+        self.events_processed.inc_by(count);
+    }
+
+    fn on_detection_matches(&self, count: u64) {
+        self.detection_matches.inc_by(count);
+    }
+
+    fn on_correlation_matches(&self, count: u64) {
+        self.correlation_matches.inc_by(count);
+    }
+
+    fn observe_processing_latency(&self, seconds: f64) {
+        self.processing_latency.observe(seconds);
+    }
+
+    fn on_input_queue_depth_change(&self, delta: i64) {
+        if delta > 0 {
+            self.input_queue_depth.add(delta);
+        } else {
+            self.input_queue_depth.sub(-delta);
+        }
+    }
+
+    fn on_back_pressure(&self) {
+        self.back_pressure_events.inc();
+    }
+
+    fn observe_batch_size(&self, size: u64) {
+        self.batch_size_histogram.observe(size as f64);
+    }
+
+    fn on_output_queue_depth_change(&self, delta: i64) {
+        if delta > 0 {
+            self.output_queue_depth.add(delta);
+        } else {
+            self.output_queue_depth.sub(-delta);
+        }
+    }
+
+    fn observe_pipeline_latency(&self, seconds: f64) {
+        self.pipeline_latency.observe(seconds);
+    }
+
+    fn set_correlation_state_entries(&self, count: u64) {
+        self.correlation_state_entries.set(count as i64);
     }
 }

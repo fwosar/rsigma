@@ -7,8 +7,8 @@ use rsigma_eval::{
 use rsigma_parser::SigmaCollection;
 
 /// Wraps a CorrelationEngine (or a plain Engine) and provides the interface
-/// the daemon needs: process events, reload rules, and query state.
-pub struct DaemonEngine {
+/// the runtime needs: process events, reload rules, and query state.
+pub struct RuntimeEngine {
     engine: EngineVariant,
     pipelines: Vec<Pipeline>,
     rules_path: std::path::PathBuf,
@@ -21,20 +21,21 @@ enum EngineVariant {
     WithCorrelations(Box<CorrelationEngine>),
 }
 
+/// Summary statistics about the loaded engine state.
 pub struct EngineStats {
     pub detection_rules: usize,
     pub correlation_rules: usize,
     pub state_entries: usize,
 }
 
-impl DaemonEngine {
+impl RuntimeEngine {
     pub fn new(
         rules_path: std::path::PathBuf,
         pipelines: Vec<Pipeline>,
         corr_config: CorrelationConfig,
         include_event: bool,
     ) -> Self {
-        DaemonEngine {
+        RuntimeEngine {
             engine: EngineVariant::DetectionOnly(Engine::new()),
             pipelines,
             rules_path,
@@ -114,6 +115,7 @@ impl DaemonEngine {
         }
     }
 
+    /// Return summary statistics about the current engine state.
     pub fn stats(&self) -> EngineStats {
         match &self.engine {
             EngineVariant::DetectionOnly(engine) => EngineStats {
@@ -129,8 +131,24 @@ impl DaemonEngine {
         }
     }
 
+    /// Return the path from which rules are loaded.
     pub fn rules_path(&self) -> &Path {
         &self.rules_path
+    }
+
+    /// Return the configured processing pipelines.
+    pub fn pipelines(&self) -> &[Pipeline] {
+        &self.pipelines
+    }
+
+    /// Return the correlation configuration.
+    pub fn corr_config(&self) -> &CorrelationConfig {
+        &self.corr_config
+    }
+
+    /// Whether detection results include the matched event.
+    pub fn include_event(&self) -> bool {
+        self.include_event
     }
 
     /// Export correlation state as a serializable snapshot.

@@ -2,7 +2,7 @@ use std::io::Write;
 
 use rsigma_eval::ProcessResult;
 
-use super::StreamingError;
+use crate::error::RuntimeError;
 
 /// Serializes ProcessResult to NDJSON and writes to stdout.
 pub struct StdoutSink {
@@ -15,7 +15,7 @@ impl StdoutSink {
     }
 
     /// Serialize and write a ProcessResult to stdout.
-    pub fn send(&self, result: &ProcessResult) -> Result<(), StreamingError> {
+    pub fn send(&self, result: &ProcessResult) -> Result<(), RuntimeError> {
         if result.detections.is_empty() && result.correlations.is_empty() {
             return Ok(());
         }

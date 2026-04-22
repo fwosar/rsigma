@@ -2,7 +2,7 @@ use async_nats::{Client, subject::Subject};
 
 use rsigma_eval::ProcessResult;
 
-use super::StreamingError;
+use crate::error::RuntimeError;
 
 /// Publishes ProcessResult as NDJSON to a NATS subject.
 pub struct NatsSink {
@@ -21,7 +21,7 @@ impl NatsSink {
     }
 
     /// Serialize and publish a ProcessResult to the configured NATS subject.
-    pub async fn send(&self, result: &ProcessResult) -> Result<(), StreamingError> {
+    pub async fn send(&self, result: &ProcessResult) -> Result<(), RuntimeError> {
         if result.detections.is_empty() && result.correlations.is_empty() {
             return Ok(());
         }
@@ -31,7 +31,7 @@ impl NatsSink {
             self.client
                 .publish(self.subject.clone(), json.into())
                 .await
-                .map_err(|e| StreamingError::Io(std::io::Error::other(e)))?;
+                .map_err(|e| RuntimeError::Io(std::io::Error::other(e)))?;
         }
 
         for m in &result.correlations {
@@ -39,7 +39,7 @@ impl NatsSink {
             self.client
                 .publish(self.subject.clone(), json.into())
                 .await
-                .map_err(|e| StreamingError::Io(std::io::Error::other(e)))?;
+                .map_err(|e| RuntimeError::Io(std::io::Error::other(e)))?;
         }
 
         Ok(())

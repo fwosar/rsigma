@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rsigma_eval::ProcessResult;
 
-use super::StreamingError;
+use crate::error::RuntimeError;
 
 /// Appends ProcessResult as NDJSON to a file with buffered writes.
 pub struct FileSink {
@@ -13,7 +13,7 @@ pub struct FileSink {
 
 impl FileSink {
     /// Open (or create) the file at `path` for appending.
-    pub fn open(path: &Path) -> Result<Self, StreamingError> {
+    pub fn open(path: &Path) -> Result<Self, RuntimeError> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(FileSink {
             writer: BufWriter::new(file),
@@ -21,7 +21,7 @@ impl FileSink {
     }
 
     /// Serialize and append a ProcessResult to the file.
-    pub fn send(&mut self, result: &ProcessResult) -> Result<(), StreamingError> {
+    pub fn send(&mut self, result: &ProcessResult) -> Result<(), RuntimeError> {
         if result.detections.is_empty() && result.correlations.is_empty() {
             return Ok(());
         }
