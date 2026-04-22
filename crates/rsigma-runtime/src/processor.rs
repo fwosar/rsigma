@@ -157,8 +157,12 @@ impl LogProcessor {
         let mut new_engine = RuntimeEngine::new(rules_path, pipelines, corr_config, include_event);
         let stats = new_engine.load_rules()?;
 
-        if let Some(state) = old_state {
-            new_engine.import_state(&state);
+        if let Some(state) = old_state
+            && !new_engine.import_state(&state)
+        {
+            tracing::warn!(
+                "Incompatible correlation snapshot version during reload, starting fresh"
+            );
         }
 
         self.swap_engine(new_engine);

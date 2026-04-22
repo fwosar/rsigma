@@ -54,5 +54,7 @@ pub use io::{EventSource, FileSink, Sink, StdinSource, StdoutSink, spawn_source}
 pub use metrics::{MetricsHook, NoopMetrics};
 pub use processor::LogProcessor;
 
+pub use rsigma_eval::ProcessResult;
+
 #[cfg(feature = "nats")]
 pub use io::{NatsSink, NatsSource};

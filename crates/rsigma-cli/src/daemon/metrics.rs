@@ -114,13 +114,10 @@ impl Metrics {
         )
         .unwrap();
         let batch_size_histogram = Histogram::with_opts(
-            HistogramOpts::new(
-                "rsigma_batch_size",
-                "Number of events processed per engine lock acquisition",
-            )
-            .buckets(vec![
-                1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0,
-            ]),
+            HistogramOpts::new("rsigma_batch_size", "Number of events processed per batch")
+                .buckets(vec![
+                    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0,
+                ]),
         )
         .unwrap();
 
