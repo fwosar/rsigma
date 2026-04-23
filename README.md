@@ -6,6 +6,7 @@ A complete Rust toolkit for the [Sigma](https://github.com/SigmaHQ/sigma) detect
 |-------|-------------|
 | [`rsigma-parser`](crates/rsigma-parser/) | Parse Sigma YAML into a strongly-typed AST |
 | [`rsigma-eval`](crates/rsigma-eval/) | Compile and evaluate rules against JSON events |
+| [`rsigma-runtime`](crates/rsigma-runtime/) | Streaming runtime — input adapters, log processor, hot-reload |
 | [`rsigma`](crates/rsigma-cli/) | CLI for parsing, validating, linting, evaluating rules, and running a detection daemon |
 | [`rsigma-lsp`](crates/rsigma-lsp/) | Language Server Protocol (LSP) server for IDE support |
 
@@ -84,6 +85,54 @@ let event = JsonEvent::borrow(&json!({"CommandLine": "cmd /c whoami"}));
 let matches = engine.evaluate(&event);
 assert_eq!(matches[0].rule_title, "Detect Whoami");
 ```
+
+## Streaming Runtime
+
+`rsigma-runtime` provides a reusable pipeline for streaming log detection. It
+handles input parsing (JSON, syslog, logfmt, CEF, plain text, auto-detect),
+batch evaluation with parallel detection + sequential correlation, atomic
+hot-reload via `ArcSwap`, and pluggable metrics.
+
+```rust
+use std::sync::Arc;
+use rsigma_eval::CorrelationConfig;
+use rsigma_runtime::{InputFormat, LogProcessor, NoopMetrics, RuntimeEngine};
+
+// Load rules
+let mut engine = RuntimeEngine::new(
+    "rules/".into(),
+    vec![],
+    CorrelationConfig::default(),
+    false,
+);
+engine.load_rules().unwrap();
+
+let processor = LogProcessor::new(engine, Arc::new(NoopMetrics));
+
+// Process a batch of raw log lines (any format)
+let batch = vec![
+    r#"{"CommandLine": "cmd /c whoami", "EventID": 1}"#.to_string(),
+];
+let results = processor.process_batch_with_format(
+    &batch,
+    &InputFormat::Json,
+    None,
+);
+
+for result in &results {
+    for det in &result.detections {
+        println!("Detection: {}", det.rule_title);
+    }
+}
+```
+
+Input formats are selected via `--input-format` on the CLI or `InputFormat` in
+the library. Auto-detect (the default) tries JSON → syslog → plain text.
+Feature-gated formats: `logfmt`, `cef`.
+
+See [`examples/jsonl_stdin.rs`](crates/rsigma-runtime/examples/jsonl_stdin.rs) and
+[`examples/tail_syslog.rs`](crates/rsigma-runtime/examples/tail_syslog.rs) for
+complete working examples.
 
 ## Architecture
 
