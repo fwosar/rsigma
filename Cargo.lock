@@ -2996,7 +2996,6 @@ dependencies = [
  "rand 0.9.4",
  "rsigma-eval",
  "rsigma-parser",
- "serde",
  "serde_json",
  "syslog_loose",
  "tempfile",
