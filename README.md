@@ -165,25 +165,48 @@ complete working examples.
     ┌──────────────────────────────────────────┐   ┌────────────────────┐
     │              rsigma-eval                 │   │    rsigma-lsp      │
     │                                          │   │                    │
-    │  pipeline/ ──> Pipeline (YAML parsing,   │   │  LSP server over   │
-    │    conditions, transformations, state)   │   │  stdio (tower-lsp) │
-    │    ↓ transforms SigmaRule AST            │   │                    │
-    │                                          │   │  • diagnostics     │
-    │  compiler.rs ──> CompiledRule            │   │    (lint + parse   │
-    │  matcher.rs  ──> CompiledMatcher         │   │     + compile)     │
-    │  engine.rs   ──> Engine (stateless)      │   │  • completions     │
-    │                                          │   │  • hover           │
-    │  correlation.rs ──> CompiledCorrelation  │   │  • document        │
-    │    + EventBuffer (deflate-compressed)    │   │    symbols         │
-    │  correlation_engine.rs ──> (stateful)    │   │                    │
-    │    sliding windows, group-by, chaining,  │   │  Editors:          │
-    │    alert suppression, action-on-fire,    │   │  VSCode, Neovim,   │
-    │    memory management, event inclusion    │   │  Helix, Zed, ...   │
-    │                                          │   └────────────────────┘
+    │  Event trait ──> JsonEvent, KvEvent,     │   │  LSP server over   │
+    │    PlainEvent (static dispatch)          │   │  stdio (tower-lsp) │
+    │                                          │   │                    │
+    │  pipeline/ ──> Pipeline (YAML parsing,   │   │  • diagnostics     │
+    │    conditions, transformations, state)   │   │    (lint + parse   │
+    │    ↓ transforms SigmaRule AST            │   │     + compile)     │
+    │                                          │   │  • completions     │
+    │  compiler.rs ──> CompiledRule            │   │  • hover           │
+    │  matcher.rs  ──> CompiledMatcher         │   │  • document        │
+    │  engine.rs   ──> Engine (stateless)      │   │    symbols         │
+    │                                          │   │                    │
+    │  correlation.rs ──> CompiledCorrelation  │   │  Editors:          │
+    │    + EventBuffer (deflate-compressed)    │   │  VSCode, Neovim,   │
+    │  correlation_engine.rs ──> (stateful)    │   │  Helix, Zed, ...   │
+    │    sliding windows, group-by, chaining,  │   └────────────────────┘
+    │    alert suppression, action-on-fire,    │
+    │    memory management, event inclusion    │
+    │                                          │
     │  rsigma.* custom attributes ─────────>   │
     │    engine config from pipelines          │
     └──────────────────────────────────────────┘
               │
+              ▼
+    ┌──────────────────────────────────────────┐
+    │            rsigma-runtime                │
+    │                                          │
+    │  input/ ──> format adapters:             │
+    │    JSON, syslog, logfmt*, CEF*,          │
+    │    plain text, auto-detect               │
+    │    ↓ raw line → EventInputDecoded        │
+    │                                          │
+    │  LogProcessor ──> batch evaluation       │
+    │    ArcSwap hot-reload, MetricsHook,      │
+    │    EventFilter (JSON payload extraction) │
+    │                                          │
+    │  RuntimeEngine ──> wraps Engine +        │
+    │    CorrelationEngine with rule loading   │
+    │                                          │
+    │  io/ ──> EventSource (stdin, HTTP, NATS) │
+    │          Sink (stdout, file, NATS)       │
+    └──────────────────────────────────────────┘
+              │                (* = feature-gated)
               ▼
      ┌────────────────────┐
      │  MatchResult       │──> rule title, id, level, tags,
