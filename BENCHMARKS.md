@@ -54,6 +54,47 @@ cargo bench -p rsigma-runtime -- --baseline before
 | `runtime_vs_raw` | Overhead comparison: raw `Engine::evaluate` vs `LogProcessor` pipeline |
 | `runtime_rule_scaling` | `LogProcessor` throughput scaling across 100–1000 rules |
 
+## Baseline results (v0.6.0)
+
+Recorded on Apple M4 Pro, macOS, `cargo bench -p rsigma-runtime` with
+`--release` (Criterion default). 100 synthetic detection rules, seeded RNG
+for reproducibility.
+
+### Runtime throughput (LogProcessor pipeline)
+
+| Group | Events | Median | Throughput |
+|-------|-------:|-------:|-----------:|
+| `runtime_json` | 1,000 | 1.05 ms | 955 Kelem/s |
+| `runtime_json` | 10,000 | 8.71 ms | 1.15 Melem/s |
+| `runtime_syslog` | 1,000 | 796 µs | 1.26 Melem/s |
+| `runtime_syslog` | 10,000 | 7.15 ms | 1.40 Melem/s |
+| `runtime_plain` | 1,000 | 180 µs | 5.54 Melem/s |
+| `runtime_plain` | 10,000 | 918 µs | 10.89 Melem/s |
+| `runtime_auto` | 1,000 | 1.04 ms | 966 Kelem/s |
+| `runtime_auto` | 10,000 | 9.13 ms | 1.09 Melem/s |
+
+### Raw engine vs LogProcessor overhead (10K events, 100 rules)
+
+| Mode | Median | Throughput |
+|------|-------:|-----------:|
+| Raw `Engine::evaluate` (pre-parsed) | 10.37 ms | 965 Kelem/s |
+| `LogProcessor` JSON | 8.87 ms | 1.13 Melem/s |
+| `LogProcessor` auto-detect | 8.79 ms | 1.14 Melem/s |
+
+The `LogProcessor` pipeline is faster than raw sequential `Engine::evaluate`
+because it uses `evaluate_batch` (parallel via rayon) internally.
+
+### Rule-count scaling (1K JSON events)
+
+| Rules | Median | Throughput |
+|------:|-------:|-----------:|
+| 100 | 1.04 ms | 965 Kelem/s |
+| 500 | 1.04 ms | 963 Kelem/s |
+| 1,000 | 1.05 ms | 954 Kelem/s |
+
+Throughput is near-constant from 100 to 1,000 rules thanks to the logsource
+index pruning most rules before evaluation.
+
 ## Regression policy
 
 - **Threshold**: a regression of **> 5%** in any benchmark group's median runtime
@@ -65,12 +106,18 @@ cargo bench -p rsigma-runtime -- --baseline before
 
 ## Interpreting results
 
-- `runtime_vs_raw` shows the overhead of the `LogProcessor` abstraction
-  (JSON parsing, format dispatch, metrics hooks, `ArcSwap` loads) compared to
-  calling `Engine::evaluate` directly on pre-parsed events. Expect 1.5–3x
-  overhead from JSON parsing alone.
+- `runtime_vs_raw` compares sequential `Engine::evaluate` (one event at a
+  time, pre-parsed) against the `LogProcessor` pipeline (which includes JSON
+  parsing but uses `evaluate_batch` for parallel detection via rayon). The
+  pipeline is typically *faster* overall because batch parallelism outweighs
+  the parsing overhead.
 - `runtime_auto` vs `runtime_json` shows the cost of format auto-detection.
   For homogeneous high-volume streams, specifying `--input-format json` (etc.)
-  explicitly avoids this overhead.
-- Syslog throughput is lower than JSON because `syslog_loose` parsing and
-  year resolution add per-line work.
+  explicitly avoids the auto-detect probe overhead.
+- Plain text is the fastest format because there is no structured parsing —
+  lines are wrapped directly into `PlainEvent` for keyword matching.
+- Syslog throughput is higher than JSON because the `syslog_loose` parser +
+  `KvEvent` construction is cheaper than `serde_json` deserialization for
+  these synthetic payloads. Real-world results may vary with message complexity.
+- Rule-count scaling is near-flat from 100 to 1,000 rules because the
+  logsource index prunes non-matching rules before evaluation.
