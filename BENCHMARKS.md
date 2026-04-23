@@ -54,7 +54,7 @@ cargo bench -p rsigma-runtime -- --baseline before
 | `runtime_vs_raw` | Overhead comparison: raw `Engine::evaluate` vs `LogProcessor` pipeline |
 | `runtime_rule_scaling` | `LogProcessor` throughput scaling across 100–1000 rules |
 
-## Baseline results (v0.6.0)
+## Baseline results (v0.7.0)
 
 Recorded on Apple M4 Pro, macOS, `cargo bench -p rsigma-runtime` with
 `--release` (Criterion default). 100 synthetic detection rules, seeded RNG
