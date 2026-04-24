@@ -100,10 +100,7 @@ assert_eq!(matches[0].rule_title, "Detect Whoami");
 
 ## Streaming Runtime
 
-`rsigma-runtime` provides a reusable pipeline for streaming log detection. It
-handles input parsing (JSON, syslog, logfmt, CEF, plain text, auto-detect),
-batch evaluation with parallel detection + sequential correlation, atomic
-hot-reload via `ArcSwap`, and pluggable metrics.
+`rsigma-runtime` provides a reusable pipeline for streaming log detection. It handles input parsing (JSON, syslog, logfmt, CEF, plain text, auto-detect), batch evaluation with parallel detection + sequential correlation, atomic hot-reload via `ArcSwap`, and pluggable metrics.
 
 ```rust
 use std::sync::Arc;
@@ -138,13 +135,9 @@ for result in &results {
 }
 ```
 
-Input formats are selected via `--input-format` on the CLI or `InputFormat` in
-the library. Auto-detect (the default) tries JSON → syslog → plain text.
-Feature-gated formats: `logfmt`, `cef`.
+Input formats are selected via `--input-format` on the CLI or `InputFormat` in the library. Auto-detect (the default) tries JSON → syslog → plain text. Feature-gated formats: `logfmt`, `cef`.
 
-See [`examples/jsonl_stdin.rs`](crates/rsigma-runtime/examples/jsonl_stdin.rs) and
-[`examples/tail_syslog.rs`](crates/rsigma-runtime/examples/tail_syslog.rs) for
-complete working examples.
+See [`examples/jsonl_stdin.rs`](crates/rsigma-runtime/examples/jsonl_stdin.rs) and [`examples/tail_syslog.rs`](crates/rsigma-runtime/examples/tail_syslog.rs) for complete working examples.
 
 ## Architecture
 
@@ -241,8 +234,7 @@ All four crates share a single version (set in the workspace `Cargo.toml`) and a
 
 1. Bump the version in the root `Cargo.toml`.
 2. Commit, push to `main`.
-3. Create a GitHub Release (e.g. tag `v0.2.0`). The `publish.yml` workflow triggers
-   automatically and publishes all crates in dependency order.
+3. Create a GitHub Release (e.g. tag `v0.2.0`). The `publish.yml` workflow triggers automatically and publishes all crates in dependency order.
 
 ### Dry run
 
@@ -251,9 +243,7 @@ Manual runs automatically pass `--dry-run` to every `cargo publish` invocation.
 
 ### Recovering from a partial failure
 
-If the workflow fails midway (e.g. `rsigma-parser` was published but `rsigma-eval`
-failed), re-running the workflow will fail at the already-published crate.
-To recover, publish the remaining crates manually in order:
+If the workflow fails midway (e.g. `rsigma-parser` was published but `rsigma-eval` failed), re-running the workflow will fail at the already-published crate. To recover, publish the remaining crates manually in order:
 
 ```bash
 # Skip crates that were already published successfully

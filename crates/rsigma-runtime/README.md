@@ -1,20 +1,13 @@
 # rsigma-runtime
 
-Streaming runtime for [rsigma](https://github.com/timescale/rsigma) — input
-format adapters, batch log processing, hot-reload, and pluggable metrics.
+Streaming runtime for [rsigma](https://github.com/timescale/rsigma) — input format adapters, batch log processing, hot-reload, and pluggable metrics.
 
 ## Features
 
-- **Input adapters**: JSON/NDJSON, syslog (RFC 3164/5424), logfmt, CEF, plain
-  text, and auto-detect. Each adapter parses raw log lines into typed events
-  implementing the `rsigma_eval::Event` trait.
-- **`LogProcessor`**: batch evaluation pipeline with atomic engine swap via
-  `ArcSwap`, `MetricsHook` for pluggable metrics, and `EventFilter` for JSON
-  payload extraction.
-- **`RuntimeEngine`**: wraps `Engine` and `CorrelationEngine` with rule loading,
-  reload, and correlation state management.
-- **I/O**: `EventSource` trait (stdin, HTTP, NATS) and `Sink` enum (stdout,
-  file, NATS) with fan-out support.
+- **Input adapters**: JSON/NDJSON, syslog (RFC 3164/5424), logfmt, CEF, plain text, and auto-detect. Each adapter parses raw log lines into typed events implementing the `rsigma_eval::Event` trait.
+- **`LogProcessor`**: batch evaluation pipeline with atomic engine swap via `ArcSwap`, `MetricsHook` for pluggable metrics, and `EventFilter` for JSON payload extraction.
+- **`RuntimeEngine`**: wraps `Engine` and `CorrelationEngine` with rule loading, reload, and correlation state management.
+- **I/O**: `EventSource` trait (stdin, HTTP, NATS) and `Sink` enum (stdout, file, NATS) with fan-out support.
 
 ## Usage
 

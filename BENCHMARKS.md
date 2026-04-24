@@ -56,9 +56,7 @@ cargo bench -p rsigma-runtime -- --baseline before
 
 ## Baseline results (v0.7.0)
 
-Recorded on Apple M4 Pro, macOS, `cargo bench -p rsigma-runtime` with
-`--release` (Criterion default). 100 synthetic detection rules, seeded RNG
-for reproducibility.
+Recorded on Apple M4 Pro, macOS, `cargo bench -p rsigma-runtime` with `--release` (Criterion default). 100 synthetic detection rules, seeded RNG for reproducibility.
 
 ### Runtime throughput (LogProcessor pipeline)
 
@@ -81,8 +79,7 @@ for reproducibility.
 | `LogProcessor` JSON | 8.87 ms | 1.13 Melem/s |
 | `LogProcessor` auto-detect | 8.79 ms | 1.14 Melem/s |
 
-The `LogProcessor` pipeline is faster than raw sequential `Engine::evaluate`
-because it uses `evaluate_batch` (parallel via rayon) internally.
+The `LogProcessor` pipeline is faster than raw sequential `Engine::evaluate` because it uses `evaluate_batch` (parallel via rayon) internally.
 
 ### Rule-count scaling (1K JSON events)
 
@@ -92,8 +89,7 @@ because it uses `evaluate_batch` (parallel via rayon) internally.
 | 500 | 1.04 ms | 963 Kelem/s |
 | 1,000 | 1.05 ms | 954 Kelem/s |
 
-Throughput is near-constant from 100 to 1,000 rules thanks to the logsource
-index pruning most rules before evaluation.
+Throughput is near-constant from 100 to 1,000 rules thanks to the logsource index pruning most rules before evaluation.
 
 ## Regression policy
 
@@ -106,18 +102,8 @@ index pruning most rules before evaluation.
 
 ## Interpreting results
 
-- `runtime_vs_raw` compares sequential `Engine::evaluate` (one event at a
-  time, pre-parsed) against the `LogProcessor` pipeline (which includes JSON
-  parsing but uses `evaluate_batch` for parallel detection via rayon). The
-  pipeline is typically *faster* overall because batch parallelism outweighs
-  the parsing overhead.
-- `runtime_auto` vs `runtime_json` shows the cost of format auto-detection.
-  For homogeneous high-volume streams, specifying `--input-format json` (etc.)
-  explicitly avoids the auto-detect probe overhead.
-- Plain text is the fastest format because there is no structured parsing —
-  lines are wrapped directly into `PlainEvent` for keyword matching.
-- Syslog throughput is higher than JSON because the `syslog_loose` parser +
-  `KvEvent` construction is cheaper than `serde_json` deserialization for
-  these synthetic payloads. Real-world results may vary with message complexity.
-- Rule-count scaling is near-flat from 100 to 1,000 rules because the
-  logsource index prunes non-matching rules before evaluation.
+- `runtime_vs_raw` compares sequential `Engine::evaluate` (one event at a time, pre-parsed) against the `LogProcessor` pipeline (which includes JSON parsing but uses `evaluate_batch` for parallel detection via rayon). The pipeline is typically *faster* overall because batch parallelism outweighs the parsing overhead.
+- `runtime_auto` vs `runtime_json` shows the cost of format auto-detection. For homogeneous high-volume streams, specifying `--input-format json` (etc.) explicitly avoids the auto-detect probe overhead.
+- Plain text is the fastest format because there is no structured parsing — lines are wrapped directly into `PlainEvent` for keyword matching.
+- Syslog throughput is higher than JSON because the `syslog_loose` parser + `KvEvent` construction is cheaper than `serde_json` deserialization for these synthetic payloads. Real-world results may vary with message complexity.
+- Rule-count scaling is near-flat from 100 to 1,000 rules because the logsource index prunes non-matching rules before evaluation.
