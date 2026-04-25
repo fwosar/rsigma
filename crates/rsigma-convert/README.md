@@ -98,15 +98,73 @@ for result in &output.queries {
 | `timescaledb` | Queries with `time_bucket()` for TimescaleDB optimization |
 | `continuous_aggregate` | `CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)` |
 
-### PostgreSQL with OCSF pipeline
+### Custom table, schema, and database
 
-An OCSF processing pipeline is included at `pipelines/ocsf_postgres.yml` that maps common Sigma field names (Windows Sysmon, authentication, network, DNS, etc.) to OCSF-normalized column names.
+The target table and schema can be set at three levels (highest precedence first):
+
+1. **Rule-level `custom_attributes`** — `postgres.table`, `postgres.schema`, `postgres.database`
+2. **Pipeline state** — `set_state` with `key: table`, `key: schema`
+3. **Backend defaults** — `PostgresBackend.table`, `.schema`, `.database`
+
+Example rule with custom attributes:
+
+```yaml
+title: Process Creation
+logsource:
+    category: process_creation
+detection:
+    selection:
+        CommandLine|contains: 'whoami'
+    condition: selection
+custom_attributes:
+    postgres.table: process_events
+    postgres.schema: siem
+```
+
+### OCSF pipelines
+
+Two OCSF processing pipelines are included:
+
+| Pipeline | Description |
+|----------|-------------|
+| `pipelines/ocsf_postgres.yml` | Single-table — all events go to `security_events` |
+| `pipelines/ocsf_postgres_multi_table.yml` | Per-logsource routing — each category gets its own table (`process_events`, `network_events`, etc.) |
 
 ```bash
+# Single-table pipeline
 rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml
+
+# Multi-table pipeline (per-logsource routing)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres_multi_table.yml
+
+# With output format
 rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml -f view
 rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml -f continuous_aggregate
 ```
+
+### Multi-table temporal correlations
+
+When a temporal correlation rule references detection rules that target different tables (via per-logsource pipeline routing or custom attributes), the backend automatically generates a `UNION ALL` CTE:
+
+```sql
+-- Rules targeting different tables produce UNION ALL
+WITH matched AS (
+    SELECT *, 'process_rule' AS rule_name FROM process_events
+        WHERE time >= NOW() - INTERVAL '300 seconds'
+    UNION ALL
+    SELECT *, 'network_rule' AS rule_name FROM network_events
+        WHERE time >= NOW() - INTERVAL '300 seconds'
+)
+SELECT "User", COUNT(DISTINCT rule_name) AS distinct_rules,
+    MIN(time) AS first_seen, MAX(time) AS last_seen
+FROM matched
+GROUP BY "User"
+HAVING COUNT(DISTINCT rule_name) >= 2
+```
+
+When all referenced rules share the same table, the simpler single-table approach is used instead.
+
+Per-rule schemas are also tracked: if different detection rules set different schemas (via `postgres.schema` custom attribute or `set_state key: schema` in the pipeline), each leg of the UNION ALL uses the correct `schema.table`.
 
 ### Reference schema
 
@@ -173,7 +231,7 @@ The PostgreSQL backend (`PostgresBackend`) leverages native PostgreSQL features 
 | `exists` | `IS NOT NULL` / `IS NULL` |
 | keywords | `to_tsvector() @@ to_tsquery()` |
 
-Correlation rules are converted to SQL using `GROUP BY` / `HAVING` for aggregation types (`event_count`, `value_count`, `value_sum`, `value_avg`) and CTEs for temporal correlation.
+Correlation rules are converted to SQL using `GROUP BY` / `HAVING` for aggregation types (`event_count`, `value_count`, `value_sum`, `value_avg`, `value_percentile`, `value_median`) and CTEs for temporal correlation. Multi-table temporal correlations automatically generate `UNION ALL` CTEs when referenced rules target different tables.
 
 ### Configuration
 
@@ -181,11 +239,12 @@ Correlation rules are converted to SQL using `GROUP BY` / `HAVING` for aggregati
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `table` | `String` | `"security_events"` | Default table name (overridden by pipeline state) |
+| `table` | `String` | `"security_events"` | Default table name (overridden by pipeline state or `postgres.table` custom attribute) |
 | `timestamp_field` | `String` | `"time"` | Timestamp column for time-windowed queries |
 | `json_field` | `Option<String>` | `None` | If set, fields are accessed via JSONB (`col->>'field'`) |
 | `case_sensitive_re` | `bool` | `false` | Use `~` instead of `~*` for regex |
-| `schema` | `Option<String>` | `None` | PostgreSQL schema name (e.g. `public`, `audit`) |
+| `schema` | `Option<String>` | `None` | PostgreSQL schema name (overridden by pipeline state or `postgres.schema` custom attribute) |
+| `database` | `Option<String>` | `None` | PostgreSQL database name (connection-level metadata) |
 | `timescaledb` | `bool` | `false` | Enable TimescaleDB-specific features |
 
 ## License

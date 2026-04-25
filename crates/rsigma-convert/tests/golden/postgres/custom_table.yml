@@ -1,0 +1,11 @@
+title: Process Creation with Custom Table
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        CommandLine|contains: 'whoami'
+    condition: selection
+custom_attributes:
+    postgres.table: process_events
+    postgres.schema: siem

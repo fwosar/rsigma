@@ -78,8 +78,11 @@ rsigma convert -r rules/ -t test -p pipelines/ecs.yml -f state
 # Convert to PostgreSQL SQL
 rsigma convert -r rules/ -t postgres
 
-# Convert to PostgreSQL with OCSF field mapping pipeline
+# Convert to PostgreSQL with OCSF field mapping pipeline (single table)
 rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml
+
+# Convert with per-logsource table routing (multi-table)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres_multi_table.yml
 
 # Generate PostgreSQL views for each rule
 rsigma convert -r rules/ -t postgres -f view

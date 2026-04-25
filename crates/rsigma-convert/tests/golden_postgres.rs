@@ -90,3 +90,8 @@ fn golden_exists_null_bool() {
 fn golden_multi_field_detection() {
     run_golden("multi_field_detection");
 }
+
+#[test]
+fn golden_custom_table() {
+    run_golden("custom_table");
+}

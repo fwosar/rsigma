@@ -6,7 +6,7 @@
 //! `tsvector`/`tsquery` for full-text keyword search, and JSONB for
 //! semi-structured event data.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rsigma_eval::pipeline::state::PipelineState;
 use rsigma_parser::*;
@@ -126,6 +126,8 @@ pub struct PostgresBackend {
     pub case_sensitive_re: bool,
     /// PostgreSQL schema name (e.g. `public`).
     pub schema: Option<String>,
+    /// PostgreSQL database name (connection-level metadata, not used in queries).
+    pub database: Option<String>,
     /// Enable TimescaleDB-specific features.
     pub timescaledb: bool,
 }
@@ -139,14 +141,56 @@ impl PostgresBackend {
             json_field: None,
             case_sensitive_re: false,
             schema: None,
+            database: None,
             timescaledb: false,
         }
     }
 
-    fn qualified_table(&self) -> String {
-        match &self.schema {
-            Some(s) => format!("{s}.{}", self.table),
-            None => self.table.clone(),
+    /// Resolve the fully qualified table name `[schema.]table` using this
+    /// precedence for each component:
+    ///
+    /// **table**: `custom_attributes["postgres.table"]` > `state["table"]` > `self.table`
+    /// **schema**: `custom_attributes["postgres.schema"]` > `state["schema"]` > `self.schema`
+    fn resolve_table(
+        &self,
+        custom_attrs: &HashMap<String, serde_yaml::Value>,
+        state: &HashMap<String, serde_json::Value>,
+    ) -> String {
+        let table = custom_attrs
+            .get("postgres.table")
+            .and_then(|v| v.as_str())
+            .or(state.get("table").and_then(|v| v.as_str()))
+            .unwrap_or(&self.table);
+
+        let schema = custom_attrs
+            .get("postgres.schema")
+            .and_then(|v| v.as_str())
+            .or(state.get("schema").and_then(|v| v.as_str()))
+            .or(self.schema.as_deref())
+            .filter(|s| !s.is_empty());
+
+        match schema {
+            Some(s) => format!("{s}.{table}"),
+            None => table.to_string(),
+        }
+    }
+
+    /// Qualify a raw table name with schema. Precedence:
+    /// `per_rule_schema` > `state["schema"]` > `self.schema` > none.
+    fn qualify_table_name(
+        &self,
+        table: &str,
+        state: &HashMap<String, serde_json::Value>,
+        per_rule_schema: Option<&str>,
+    ) -> String {
+        let schema = per_rule_schema
+            .or(state.get("schema").and_then(|v| v.as_str()))
+            .or(self.schema.as_deref())
+            .filter(|s| !s.is_empty());
+
+        match schema {
+            Some(s) => format!("{s}.{table}"),
+            None => table.to_string(),
         }
     }
 
@@ -316,8 +360,6 @@ impl Backend for PostgresBackend {
         let has_wildcards = value.contains_wildcards();
 
         let like_op = if is_cased { "LIKE" } else { "ILIKE" };
-        let not_like_op = if is_cased { "NOT LIKE" } else { "NOT ILIKE" };
-        let _ = not_like_op;
 
         if is_contains || is_startswith || is_endswith || has_wildcards {
             let val = self.build_like_value(value);
@@ -537,11 +579,7 @@ impl Backend for PostgresBackend {
         query: String,
         state: &ConversionState,
     ) -> Result<String> {
-        let table = state.get_state_str("table").unwrap_or(&self.table);
-        let qualified = match &self.schema {
-            Some(s) if state.get_state_str("table").is_none() => format!("{s}.{table}"),
-            _ => table.to_string(),
-        };
+        let qualified = self.resolve_table(&rule.custom_attributes, &state.processing_state);
 
         let is_timescaledb = state
             .get_state_str("_output_format")
@@ -625,9 +663,9 @@ impl Backend for PostgresBackend {
         &self,
         rule: &CorrelationRule,
         output_format: &str,
-        _pipeline_state: &PipelineState,
+        pipeline_state: &PipelineState,
     ) -> Result<Vec<String>> {
-        let table = self.qualified_table();
+        let table = self.resolve_table(&rule.custom_attributes, &pipeline_state.state);
         let ts = &self.timestamp_field;
         let use_time_bucket =
             output_format == "timescaledb" || output_format == "continuous_aggregate";
@@ -661,6 +699,13 @@ impl Backend for PostgresBackend {
                 .and_then(|a| a.mapping.values().next().map(|s| s.as_str()))
         });
 
+        // Build per-rule table mapping from _rule_tables injected by convert_collection
+        let rule_tables: HashMap<String, String> = pipeline_state
+            .state
+            .get("_rule_tables")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
         let query = match rule.correlation_type {
             CorrelationType::EventCount => {
                 format!(
@@ -686,24 +731,18 @@ impl Backend for PostgresBackend {
                     having_clause = having_clause.replace("{agg}", &agg)
                 )
             }
-            CorrelationType::Temporal | CorrelationType::TemporalOrdered => {
-                let rule_names = rule.rules.join("', '");
-                let agg = "COUNT(DISTINCT rule_name)";
-                format!(
-                    "WITH matched AS (\
-                     SELECT *, rule_name FROM {table} \
-                     WHERE rule_name IN ('{rule_names}') \
-                     AND {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
-                     ) \
-                     SELECT {group_by_select}\
-                     {agg} AS distinct_rules, \
-                     MIN({ts}) AS first_seen, MAX({ts}) AS last_seen \
-                     FROM matched\
-                     {group_by_clause} \
-                     HAVING {having_clause}",
-                    having_clause = having_clause.replace("{agg}", agg)
-                )
-            }
+            CorrelationType::Temporal | CorrelationType::TemporalOrdered => self
+                .build_temporal_query(
+                    rule,
+                    &table,
+                    ts,
+                    window_secs,
+                    &group_by_select,
+                    &group_by_clause,
+                    &having_clause,
+                    &rule_tables,
+                    pipeline_state,
+                )?,
             CorrelationType::ValueSum => {
                 let field = value_field
                     .map(|f| self.field_expr(f))
@@ -783,6 +822,95 @@ impl PostgresBackend {
             CorrelationCondition::Extended(_) => Err(ConvertError::UnsupportedCorrelation(
                 "extended boolean conditions not yet supported for PostgreSQL".into(),
             )),
+        }
+    }
+
+    /// Build a temporal or temporal_ordered correlation query.
+    ///
+    /// When all referenced rules target the same table, produces a single-table
+    /// CTE filtering on `rule_name IN (...)`. When rules target different tables
+    /// (from `_rule_tables` pipeline state), produces a `UNION ALL` CTE with one
+    /// leg per rule.
+    #[allow(clippy::too_many_arguments)]
+    fn build_temporal_query(
+        &self,
+        rule: &CorrelationRule,
+        default_table: &str,
+        ts: &str,
+        window_secs: u64,
+        group_by_select: &str,
+        group_by_clause: &str,
+        having_clause: &str,
+        rule_tables: &HashMap<String, String>,
+        pipeline_state: &PipelineState,
+    ) -> Result<String> {
+        let agg = "COUNT(DISTINCT rule_name)";
+        let having = having_clause.replace("{agg}", agg);
+
+        let rule_schemas: HashMap<String, String> = pipeline_state
+            .state
+            .get("_rule_schemas")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // Collect per-rule tables, qualifying each with its own schema
+        let mut table_to_rules: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for rule_ref in &rule.rules {
+            let raw_table = rule_tables.get(rule_ref).map(|s| s.as_str());
+            let per_rule_schema = rule_schemas.get(rule_ref).map(|s| s.as_str());
+            let qualified = match raw_table {
+                Some(t) => self.qualify_table_name(t, &pipeline_state.state, per_rule_schema),
+                None => default_table.to_string(),
+            };
+            table_to_rules
+                .entry(qualified)
+                .or_default()
+                .push(rule_ref.clone());
+        }
+
+        if table_to_rules.len() <= 1 {
+            // Single table — filter by rule_name column
+            let rule_names = rule.rules.join("', '");
+            Ok(format!(
+                "WITH matched AS (\
+                 SELECT *, rule_name FROM {default_table} \
+                 WHERE rule_name IN ('{rule_names}') \
+                 AND {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
+                 ) \
+                 SELECT {group_by_select}\
+                 {agg} AS distinct_rules, \
+                 MIN({ts}) AS first_seen, MAX({ts}) AS last_seen \
+                 FROM matched\
+                 {group_by_clause} \
+                 HAVING {having}"
+            ))
+        } else {
+            // Multi-table — UNION ALL CTE with one leg per rule
+            let union_parts: Vec<String> = table_to_rules
+                .iter()
+                .flat_map(|(tbl, rules)| {
+                    rules.iter().map(move |rule_ref| {
+                        format!(
+                            "SELECT *, '{rule_ref}' AS rule_name FROM {tbl} \
+                             WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'"
+                        )
+                    })
+                })
+                .collect();
+
+            let union_cte = union_parts.join(" UNION ALL ");
+
+            Ok(format!(
+                "WITH matched AS (\
+                 {union_cte}\
+                 ) \
+                 SELECT {group_by_select}\
+                 {agg} AS distinct_rules, \
+                 MIN({ts}) AS first_seen, MAX({ts}) AS last_seen \
+                 FROM matched\
+                 {group_by_clause} \
+                 HAVING {having}"
+            ))
         }
     }
 }
@@ -1503,6 +1631,555 @@ detection:
                  SELECT time_bucket('1 hour', time) AS bucket, * \
                  FROM security_events WHERE \"FieldA\" = 'val1' WITH NO DATA"
             ]
+        );
+    }
+
+    // --- resolve_table precedence ---
+
+    #[test]
+    fn test_resolve_table_defaults() {
+        let backend = PostgresBackend::new();
+        let attrs = HashMap::new();
+        let state = HashMap::new();
+        assert_eq!(backend.resolve_table(&attrs, &state), "security_events");
+    }
+
+    #[test]
+    fn test_resolve_table_backend_schema() {
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("audit".to_string());
+        let attrs = HashMap::new();
+        let state = HashMap::new();
+        assert_eq!(
+            backend.resolve_table(&attrs, &state),
+            "audit.security_events"
+        );
+    }
+
+    #[test]
+    fn test_resolve_table_state_overrides_default() {
+        let backend = PostgresBackend::new();
+        let attrs = HashMap::new();
+        let mut state = HashMap::new();
+        state.insert("table".to_string(), serde_json::json!("process_events"));
+        assert_eq!(backend.resolve_table(&attrs, &state), "process_events");
+    }
+
+    #[test]
+    fn test_resolve_table_state_with_backend_schema() {
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("audit".to_string());
+        let attrs = HashMap::new();
+        let mut state = HashMap::new();
+        state.insert("table".to_string(), serde_json::json!("process_events"));
+        assert_eq!(
+            backend.resolve_table(&attrs, &state),
+            "audit.process_events"
+        );
+    }
+
+    #[test]
+    fn test_resolve_table_state_schema_overrides_backend() {
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("audit".to_string());
+        let attrs = HashMap::new();
+        let mut state = HashMap::new();
+        state.insert("table".to_string(), serde_json::json!("process_events"));
+        state.insert("schema".to_string(), serde_json::json!("siem"));
+        assert_eq!(backend.resolve_table(&attrs, &state), "siem.process_events");
+    }
+
+    #[test]
+    fn test_resolve_table_custom_attrs_override_all() {
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("audit".to_string());
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "postgres.table".to_string(),
+            serde_yaml::Value::String("my_events".to_string()),
+        );
+        attrs.insert(
+            "postgres.schema".to_string(),
+            serde_yaml::Value::String("custom".to_string()),
+        );
+        let mut state = HashMap::new();
+        state.insert("table".to_string(), serde_json::json!("pipeline_events"));
+        state.insert("schema".to_string(), serde_json::json!("siem"));
+        assert_eq!(backend.resolve_table(&attrs, &state), "custom.my_events");
+    }
+
+    #[test]
+    fn test_resolve_table_custom_table_only() {
+        let backend = PostgresBackend::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "postgres.table".to_string(),
+            serde_yaml::Value::String("my_events".to_string()),
+        );
+        let state = HashMap::new();
+        assert_eq!(backend.resolve_table(&attrs, &state), "my_events");
+    }
+
+    #[test]
+    fn test_resolve_table_empty_schema_treated_as_none() {
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("audit".to_string());
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "postgres.schema".to_string(),
+            serde_yaml::Value::String(String::new()),
+        );
+        let state = HashMap::new();
+        // Empty schema in custom_attrs removes the schema prefix
+        assert_eq!(backend.resolve_table(&attrs, &state), "security_events");
+    }
+
+    // --- Custom attributes in detection rules ---
+
+    #[test]
+    fn test_custom_table_via_custom_attributes() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        FieldA: val1
+    condition: selection
+custom_attributes:
+    postgres.table: custom_events
+    postgres.schema: siem
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let queries = backend
+            .convert_rule(&collection.rules[0], "default", &PipelineState::default())
+            .unwrap();
+        assert_eq!(
+            queries,
+            vec![r#"SELECT * FROM siem.custom_events WHERE "FieldA" = 'val1'"#]
+        );
+    }
+
+    // --- Pipeline state table override ---
+
+    #[test]
+    fn test_pipeline_state_table_override() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        FieldA: val1
+    condition: selection
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+        pipeline_state.set_state("table".to_string(), serde_json::json!("process_events"));
+        let queries = backend
+            .convert_rule(&collection.rules[0], "default", &pipeline_state)
+            .unwrap();
+        assert_eq!(
+            queries,
+            vec![r#"SELECT * FROM process_events WHERE "FieldA" = 'val1'"#]
+        );
+    }
+
+    // --- Correlation with pipeline state ---
+
+    #[test]
+    fn test_correlation_uses_pipeline_state_table() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Brute Force
+correlation:
+    type: event_count
+    rules:
+        - failed_login
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 10
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+        pipeline_state.set_state("table".to_string(), serde_json::json!("auth_events"));
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].contains("FROM auth_events"));
+    }
+
+    #[test]
+    fn test_correlation_custom_attributes_table() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Brute Force
+correlation:
+    type: event_count
+    rules:
+        - failed_login
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 10
+custom_attributes:
+    postgres.table: login_events
+    postgres.schema: auth
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "default",
+                &PipelineState::default(),
+            )
+            .unwrap();
+        assert_eq!(queries.len(), 1);
+        assert!(
+            queries[0].contains("FROM auth.login_events"),
+            "expected table auth.login_events in: {}",
+            queries[0]
+        );
+    }
+
+    // --- Multi-table UNION ALL for temporal correlations ---
+
+    #[test]
+    fn test_temporal_single_table_unchanged() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Multi-Stage Attack
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 2
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "default",
+                &PipelineState::default(),
+            )
+            .unwrap();
+        assert_eq!(queries.len(), 1);
+        // No UNION ALL — single table approach
+        assert!(
+            queries[0].contains("rule_name IN ('rule_a', 'rule_b')"),
+            "expected single-table approach in: {}",
+            queries[0]
+        );
+        assert!(
+            !queries[0].contains("UNION ALL"),
+            "should not contain UNION ALL in single-table mode"
+        );
+    }
+
+    #[test]
+    fn test_temporal_multi_table_union_all() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Multi-Stage Attack
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 2
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        // Inject _rule_tables mapping different rules to different tables
+        let rule_tables = serde_json::json!({
+            "rule_a": "process_events",
+            "rule_b": "network_events"
+        });
+        pipeline_state.set_state("_rule_tables".to_string(), rule_tables);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        assert_eq!(queries.len(), 1);
+        let q = &queries[0];
+        assert!(q.contains("UNION ALL"), "expected UNION ALL in: {q}");
+        assert!(
+            q.contains("FROM network_events"),
+            "expected network_events in: {q}"
+        );
+        assert!(
+            q.contains("FROM process_events"),
+            "expected process_events in: {q}"
+        );
+        assert!(
+            q.contains("'rule_a' AS rule_name"),
+            "expected rule_a label in: {q}"
+        );
+        assert!(
+            q.contains("'rule_b' AS rule_name"),
+            "expected rule_b label in: {q}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_multi_table_with_backend_schema() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Multi-Stage Attack
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 2
+"#,
+        )
+        .unwrap();
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("siem".to_string());
+        let mut pipeline_state = PipelineState::default();
+
+        let rule_tables = serde_json::json!({
+            "rule_a": "process_events",
+            "rule_b": "network_events"
+        });
+        pipeline_state.set_state("_rule_tables".to_string(), rule_tables);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("FROM siem.network_events"),
+            "expected siem.network_events in: {q}"
+        );
+        assert!(
+            q.contains("FROM siem.process_events"),
+            "expected siem.process_events in: {q}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_multi_table_per_rule_schemas() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Cross-Schema Correlation
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+        - rule_c
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 2
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        pipeline_state.set_state(
+            "_rule_tables".to_string(),
+            serde_json::json!({
+                "rule_a": "process_events",
+                "rule_b": "network_events",
+                "rule_c": "auth_events"
+            }),
+        );
+        pipeline_state.set_state(
+            "_rule_schemas".to_string(),
+            serde_json::json!({
+                "rule_a": "siem",
+                "rule_b": "network",
+                "rule_c": "iam"
+            }),
+        );
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(q.contains("UNION ALL"), "expected UNION ALL in: {q}");
+        assert!(
+            q.contains("FROM iam.auth_events"),
+            "expected iam.auth_events in: {q}"
+        );
+        assert!(
+            q.contains("FROM network.network_events"),
+            "expected network.network_events in: {q}"
+        );
+        assert!(
+            q.contains("FROM siem.process_events"),
+            "expected siem.process_events in: {q}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_mixed_per_rule_and_default_schema() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Mixed Schema Correlation
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 2
+"#,
+        )
+        .unwrap();
+        let mut backend = PostgresBackend::new();
+        backend.schema = Some("default_schema".to_string());
+        let mut pipeline_state = PipelineState::default();
+
+        pipeline_state.set_state(
+            "_rule_tables".to_string(),
+            serde_json::json!({
+                "rule_a": "process_events",
+                "rule_b": "network_events"
+            }),
+        );
+        // Only rule_a has an explicit schema; rule_b falls back to backend default
+        pipeline_state.set_state(
+            "_rule_schemas".to_string(),
+            serde_json::json!({
+                "rule_a": "custom"
+            }),
+        );
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("FROM custom.process_events"),
+            "rule_a should use per-rule schema 'custom' in: {q}"
+        );
+        assert!(
+            q.contains("FROM default_schema.network_events"),
+            "rule_b should fall back to backend schema 'default_schema' in: {q}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_same_table_in_rule_tables() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Multi-Stage Attack
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 2
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        // Both rules point to the same table — single-table path
+        let rule_tables = serde_json::json!({
+            "rule_a": "security_events",
+            "rule_b": "security_events"
+        });
+        pipeline_state.set_state("_rule_tables".to_string(), rule_tables);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("UNION ALL"),
+            "same table should use single-table path, got: {q}"
+        );
+        assert!(
+            q.contains("rule_name IN ('rule_a', 'rule_b')"),
+            "expected single-table approach in: {q}"
+        );
+    }
+
+    #[test]
+    fn test_non_temporal_ignores_multi_table() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: High Event Count
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 100
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        // Even though _rule_tables has multiple tables, event_count uses the default table
+        let rule_tables = serde_json::json!({
+            "rule_a": "process_events",
+            "rule_b": "network_events"
+        });
+        pipeline_state.set_state("_rule_tables".to_string(), rule_tables);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("UNION ALL"),
+            "event_count should not use UNION ALL: {q}"
+        );
+        assert!(
+            q.contains("FROM security_events"),
+            "event_count uses default table: {q}"
         );
     }
 }

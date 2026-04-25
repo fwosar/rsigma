@@ -309,8 +309,11 @@ rsigma convert -r rule.yml -t test
 # Convert to PostgreSQL SQL
 rsigma convert -r rules/ -t postgres
 
-# Convert to PostgreSQL with OCSF field mapping
+# Convert to PostgreSQL with OCSF field mapping (single table)
 rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml
+
+# Convert with per-logsource table routing (multi-table)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres_multi_table.yml
 
 # Generate PostgreSQL views
 rsigma convert -r rules/ -t postgres -f view

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rsigma_eval::pipeline::{Pipeline, apply_pipelines_to_correlation, apply_pipelines_with_state};
 use rsigma_parser::SigmaCollection;
 
@@ -11,6 +13,12 @@ use crate::state::ConversionState;
 /// Applies each pipeline to every rule, then delegates to the backend for
 /// conversion. Errors from individual rules are collected rather than aborting
 /// the entire batch.
+///
+/// For backends that support correlation, a rule-to-table mapping is built from
+/// each detection rule's pipeline state and `postgres.table` custom attribute.
+/// This mapping is injected into the correlation pipeline state under
+/// `_rule_tables` so that temporal correlations can generate multi-table
+/// `UNION ALL` queries when referenced rules target different tables.
 pub fn convert_collection(
     backend: &dyn Backend,
     collection: &SigmaCollection,
@@ -22,6 +30,8 @@ pub fn convert_collection(
     }
 
     let mut output = ConversionOutput::new();
+    let mut rule_table_map: HashMap<String, String> = HashMap::new();
+    let mut rule_schema_map: HashMap<String, String> = HashMap::new();
 
     for rule in &collection.rules {
         let mut rule = rule.clone();
@@ -30,6 +40,34 @@ pub fn convert_collection(
         } else {
             Default::default()
         };
+
+        // Record rule → table/schema for multi-table correlation support.
+        // custom_attributes["postgres.*"] takes precedence over pipeline state.
+        let resolved_table = rule
+            .custom_attributes
+            .get("postgres.table")
+            .and_then(|v| v.as_str())
+            .or_else(|| pipeline_state.state.get("table").and_then(|v| v.as_str()));
+
+        if let Some(table) = resolved_table {
+            if let Some(id) = &rule.id {
+                rule_table_map.insert(id.clone(), table.to_string());
+            }
+            rule_table_map.insert(rule.title.clone(), table.to_string());
+        }
+
+        let resolved_schema = rule
+            .custom_attributes
+            .get("postgres.schema")
+            .and_then(|v| v.as_str())
+            .or_else(|| pipeline_state.state.get("schema").and_then(|v| v.as_str()));
+
+        if let Some(schema) = resolved_schema {
+            if let Some(id) = &rule.id {
+                rule_schema_map.insert(id.clone(), schema.to_string());
+            }
+            rule_schema_map.insert(rule.title.clone(), schema.to_string());
+        }
 
         match backend.convert_rule(&rule, output_format, &pipeline_state) {
             Ok(queries) => {
@@ -48,10 +86,23 @@ pub fn convert_collection(
     if backend.supports_correlation() {
         for corr in &collection.correlations {
             let mut corr = corr.clone();
-            if !pipelines.is_empty() {
-                apply_pipelines_to_correlation(pipelines, &mut corr)?;
+            let mut pipeline_state = if !pipelines.is_empty() {
+                apply_pipelines_to_correlation(pipelines, &mut corr)?
+            } else {
+                Default::default()
+            };
+
+            if !rule_table_map.is_empty() {
+                let map_value = serde_json::to_value(&rule_table_map)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                pipeline_state.set_state("_rule_tables".to_string(), map_value);
             }
-            let pipeline_state = Default::default();
+            if !rule_schema_map.is_empty() {
+                let map_value = serde_json::to_value(&rule_schema_map)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                pipeline_state.set_state("_rule_schemas".to_string(), map_value);
+            }
+
             match backend.convert_correlation_rule(&corr, output_format, &pipeline_state) {
                 Ok(queries) => {
                     output.queries.push(ConversionResult {

@@ -1153,16 +1153,23 @@ pub fn apply_pipelines_with_state(
     Ok(merged)
 }
 
-/// Apply multiple pipelines to a correlation rule in priority order.
+/// Apply multiple pipelines to a correlation rule in priority order,
+/// returning the merged pipeline state.
 pub fn apply_pipelines_to_correlation(
     pipelines: &[Pipeline],
     corr: &mut CorrelationRule,
-) -> Result<()> {
+) -> Result<PipelineState> {
+    let mut merged = PipelineState::default();
     for pipeline in pipelines {
         let mut state = PipelineState::new(pipeline.vars.clone());
         pipeline.apply_to_correlation(corr, &mut state)?;
+        for (k, v) in state.state {
+            merged.state.insert(k, v);
+        }
+        merged.applied_items.extend(state.applied_items);
+        merged.vars.extend(state.vars);
     }
-    Ok(())
+    Ok(merged)
 }
 
 // =============================================================================
