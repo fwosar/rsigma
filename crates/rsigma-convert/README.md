@@ -84,7 +84,7 @@ let output = convert_collection(&backend, &collection, &[], "default").unwrap();
 for result in &output.queries {
     for query in &result.queries {
         println!("{query}");
-        // Output: SELECT * FROM security_events WHERE "CommandLine" ILIKE 'whoami'
+        // Output: SELECT * FROM security_events WHERE "CommandLine" ILIKE '%whoami%'
     }
 }
 ```
@@ -102,9 +102,9 @@ for result in &output.queries {
 
 The target table and schema can be set at three levels (highest precedence first):
 
-1. **Rule-level `custom_attributes`** — `postgres.table`, `postgres.schema`, `postgres.database`
-2. **Pipeline state** — `set_state` with `key: table`, `key: schema`
-3. **Backend defaults** — `PostgresBackend.table`, `.schema`, `.database`
+1. **Rule-level `custom_attributes`**: `postgres.table`, `postgres.schema`, `postgres.database`
+2. **Pipeline state**: `set_state` with `key: table`, `key: schema`
+3. **Backend defaults**: `PostgresBackend.table`, `.schema`, `.database`
 
 Example rule with custom attributes:
 
@@ -127,8 +127,8 @@ Two OCSF processing pipelines are included:
 
 | Pipeline | Description |
 |----------|-------------|
-| `pipelines/ocsf_postgres.yml` | Single-table — all events go to `security_events` |
-| `pipelines/ocsf_postgres_multi_table.yml` | Per-logsource routing — each category gets its own table (`process_events`, `network_events`, etc.) |
+| `pipelines/ocsf_postgres.yml` | Single-table: all events go to `security_events` |
+| `pipelines/ocsf_postgres_multi_table.yml` | Per-logsource routing: each category gets its own table (`process_events`, `network_events`, etc.) |
 
 ```bash
 # Single-table pipeline
@@ -165,6 +165,8 @@ HAVING COUNT(DISTINCT rule_name) >= 2
 When all referenced rules share the same table, the simpler single-table approach is used instead.
 
 Per-rule schemas are also tracked: if different detection rules set different schemas (via `postgres.schema` custom attribute or `set_state key: schema` in the pipeline), each leg of the UNION ALL uses the correct `schema.table`.
+
+> **Important:** The multi-table `UNION ALL` uses `SELECT *` in each leg, so PostgreSQL requires all referenced tables to have the same column count and compatible column types. This works well when tables share a normalized event schema. If your tables have different column layouts, either normalize them through pipeline field-mappings or use a single-table approach with a discriminator column (e.g. `rule_name`) instead.
 
 ### Reference schema
 
@@ -229,7 +231,7 @@ The PostgreSQL backend (`PostgresBackend`) leverages native PostgreSQL features 
 | `re` | `~*` (case-insensitive regex) or `~` (with `cased`) |
 | `cidr` | `field::inet <<= 'value'::cidr` |
 | `exists` | `IS NOT NULL` / `IS NULL` |
-| keywords | `to_tsvector() @@ to_tsquery()` |
+| keywords | `to_tsvector() @@ plainto_tsquery()` |
 
 Correlation rules are converted to SQL using `GROUP BY` / `HAVING` for aggregation types (`event_count`, `value_count`, `value_sum`, `value_avg`, `value_percentile`, `value_median`) and CTEs for temporal correlation. Multi-table temporal correlations automatically generate `UNION ALL` CTEs when referenced rules target different tables.
 

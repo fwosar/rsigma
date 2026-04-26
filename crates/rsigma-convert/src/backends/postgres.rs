@@ -74,8 +74,8 @@ pub static POSTGRES_CONFIG: TextQueryConfig = TextQueryConfig {
     re_escape: &[],
     re_escape_escape_char: None,
 
-    cidr_expression: Some("{field}::inet <<= {value}::cidr"),
-    not_cidr_expression: Some("NOT ({field}::inet <<= {value}::cidr)"),
+    cidr_expression: Some("({field})::inet <<= {value}::cidr"),
+    not_cidr_expression: Some("NOT (({field})::inet <<= {value}::cidr)"),
 
     field_null_expression: "{field} IS NULL",
     field_exists_expression: Some("{field} IS NOT NULL"),
@@ -233,6 +233,28 @@ impl PostgresBackend {
         result
     }
 
+    /// Add `%` wildcards to a LIKE value based on modifier semantics.
+    /// The value is already a quoted `'...'` string from `build_like_value`.
+    fn wrap_like_wildcards(
+        &self,
+        quoted: &str,
+        is_contains: bool,
+        is_startswith: bool,
+        is_endswith: bool,
+    ) -> String {
+        if !is_contains && !is_startswith && !is_endswith {
+            return quoted.to_string();
+        }
+        let inner = &quoted[1..quoted.len() - 1];
+        let prefix = if is_contains || is_endswith { "%" } else { "" };
+        let suffix = if is_contains || is_startswith {
+            "%"
+        } else {
+            ""
+        };
+        format!("'{prefix}{inner}{suffix}'")
+    }
+
     /// Build a plain SQL string literal from a SigmaString (no wildcards).
     fn build_plain_value(&self, value: &SigmaString) -> String {
         let plain = value.as_plain().unwrap_or_else(|| value.original.clone());
@@ -362,7 +384,8 @@ impl Backend for PostgresBackend {
         let like_op = if is_cased { "LIKE" } else { "ILIKE" };
 
         if is_contains || is_startswith || is_endswith || has_wildcards {
-            let val = self.build_like_value(value);
+            let inner = self.build_like_value(value);
+            let val = self.wrap_like_wildcards(&inner, is_contains, is_startswith, is_endswith);
             return Ok(ConvertResult::Query(format!("{f} {like_op} {val}")));
         }
 
@@ -391,7 +414,7 @@ impl Backend for PostgresBackend {
         _state: &mut ConversionState,
     ) -> Result<String> {
         let f = self.field_expr(field);
-        if value.fract() == 0.0 {
+        if value.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&value) {
             Ok(format!("{f} = {}", value as i64))
         } else {
             Ok(format!("{f} = {value}"))
@@ -442,7 +465,7 @@ impl Backend for PostgresBackend {
     ) -> Result<ConvertResult> {
         let f = self.field_expr(field);
         Ok(ConvertResult::Query(format!(
-            "{f}::inet <<= '{cidr}'::cidr"
+            "({f})::inet <<= '{cidr}'::cidr"
         )))
     }
 
@@ -465,11 +488,12 @@ impl Backend for PostgresBackend {
                 )));
             }
         };
-        let val_str = if value.fract() == 0.0 {
-            (value as i64).to_string()
-        } else {
-            value.to_string()
-        };
+        let val_str =
+            if value.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&value) {
+                (value as i64).to_string()
+            } else {
+                value.to_string()
+            };
         Ok(format!("{f} {op_token} {val_str}"))
     }
 
@@ -511,36 +535,27 @@ impl Backend for PostgresBackend {
     }
 
     fn convert_keyword(&self, value: &SigmaValue, _state: &mut ConversionState) -> Result<String> {
+        let search_target = match &self.json_field {
+            Some(json_col) => format!("{json_col}::text"),
+            None => "ROW(*)::text".to_string(),
+        };
         match value {
             SigmaValue::String(s) => {
                 let plain = s.as_plain().unwrap_or_else(|| s.original.clone());
+                if plain.is_empty() {
+                    return Err(ConvertError::UnsupportedKeyword);
+                }
                 let escaped = self.escape_sql_str(&plain);
-                let search_target = match &self.json_field {
-                    Some(json_col) => format!("{json_col}::text"),
-                    None => "ROW(*)::text".to_string(),
-                };
                 Ok(format!(
-                    "to_tsvector('simple', {search_target}) @@ to_tsquery('simple', '{escaped}')"
+                    "to_tsvector('simple', {search_target}) @@ plainto_tsquery('simple', '{escaped}')"
                 ))
             }
-            SigmaValue::Integer(n) => {
-                let search_target = match &self.json_field {
-                    Some(json_col) => format!("{json_col}::text"),
-                    None => "ROW(*)::text".to_string(),
-                };
-                Ok(format!(
-                    "to_tsvector('simple', {search_target}) @@ to_tsquery('simple', '{n}')"
-                ))
-            }
-            SigmaValue::Float(f) => {
-                let search_target = match &self.json_field {
-                    Some(json_col) => format!("{json_col}::text"),
-                    None => "ROW(*)::text".to_string(),
-                };
-                Ok(format!(
-                    "to_tsvector('simple', {search_target}) @@ to_tsquery('simple', '{f}')"
-                ))
-            }
+            SigmaValue::Integer(n) => Ok(format!(
+                "to_tsvector('simple', {search_target}) @@ plainto_tsquery('simple', '{n}')"
+            )),
+            SigmaValue::Float(f) => Ok(format!(
+                "to_tsvector('simple', {search_target}) @@ plainto_tsquery('simple', '{f}')"
+            )),
             _ => Err(ConvertError::UnsupportedKeyword),
         }
     }
@@ -622,12 +637,20 @@ impl Backend for PostgresBackend {
         _state: &ConversionState,
         output_format: &str,
     ) -> Result<String> {
-        let view_name = || match &rule.id {
-            Some(id) => format!("sigma_{}", id.replace('-', "_")),
-            None => format!(
-                "sigma_{}",
-                rule.title.to_lowercase().replace([' ', '-'], "_")
-            ),
+        let view_name = || {
+            let raw = match &rule.id {
+                Some(id) => id.replace('-', "_"),
+                None => rule.title.to_lowercase().replace([' ', '-'], "_"),
+            };
+            let sanitized: String = raw
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if sanitized.is_empty() {
+                "sigma_rule".to_string()
+            } else {
+                format!("sigma_{sanitized}")
+            }
         };
 
         match output_format {
@@ -831,6 +854,15 @@ impl PostgresBackend {
     /// CTE filtering on `rule_name IN (...)`. When rules target different tables
     /// (from `_rule_tables` pipeline state), produces a `UNION ALL` CTE with one
     /// leg per rule.
+    ///
+    /// **Schema compatibility requirement:** The multi-table path uses
+    /// `SELECT * ... UNION ALL SELECT * ...`. PostgreSQL requires all legs of a
+    /// `UNION ALL` to produce the same number of columns with compatible types.
+    /// This works when all referenced tables share an identical schema (e.g. a
+    /// normalized event schema). If the tables have different column layouts the
+    /// query will fail at execution time. Callers should ensure that pipeline
+    /// field-mappings normalize the schemas, or use a single-table approach with
+    /// a discriminator column instead.
     #[allow(clippy::too_many_arguments)]
     fn build_temporal_query(
         &self,
@@ -869,7 +901,7 @@ impl PostgresBackend {
         }
 
         if table_to_rules.len() <= 1 {
-            // Single table — filter by rule_name column
+            // Single table: filter by rule_name column
             let rule_names = rule.rules.join("', '");
             Ok(format!(
                 "WITH matched AS (\
@@ -885,7 +917,7 @@ impl PostgresBackend {
                  HAVING {having}"
             ))
         } else {
-            // Multi-table — UNION ALL CTE with one leg per rule
+            // Multi-table: UNION ALL CTE with one leg per rule
             let union_parts: Vec<String> = table_to_rules
                 .iter()
                 .flat_map(|(tbl, rules)| {
@@ -1073,7 +1105,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE 'whoami'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE '%whoami%'"#]
         );
     }
 
@@ -1092,7 +1124,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE 'cmd'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE 'cmd%'"#]
         );
     }
 
@@ -1111,7 +1143,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE '.exe'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE '%.exe'"#]
         );
     }
 
@@ -1130,7 +1162,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" LIKE 'Whoami'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" LIKE '%Whoami%'"#]
         );
     }
 
@@ -1210,7 +1242,9 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "SourceIP"::inet <<= '10.0.0.0/8'::cidr"#]
+            vec![
+                r#"SELECT * FROM security_events WHERE ("SourceIP")::inet <<= '10.0.0.0/8'::cidr"#
+            ]
         );
     }
 
@@ -1421,8 +1455,8 @@ detection:
             queries,
             vec![
                 "SELECT * FROM security_events WHERE \
-                 to_tsvector('simple', ROW(*)::text) @@ to_tsquery('simple', 'whoami') OR \
-                 to_tsvector('simple', ROW(*)::text) @@ to_tsquery('simple', 'ipconfig')"
+                 to_tsvector('simple', ROW(*)::text) @@ plainto_tsquery('simple', 'whoami') OR \
+                 to_tsvector('simple', ROW(*)::text) @@ plainto_tsquery('simple', 'ipconfig')"
             ]
         );
     }
@@ -1472,6 +1506,30 @@ detection:
         );
     }
 
+    #[test]
+    fn test_jsonb_cidr() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("metadata".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        SourceIP|cidr: '10.0.0.0/8'
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec![
+                "SELECT * FROM security_events WHERE (metadata->>'SourceIP')::inet <<= '10.0.0.0/8'::cidr"
+            ]
+        );
+    }
+
     // --- Output formats ---
 
     #[test]
@@ -1498,6 +1556,31 @@ detection:
             vec![
                 r#"CREATE OR REPLACE VIEW sigma_12345678_1234_1234_1234_123456789abc AS SELECT * FROM security_events WHERE "FieldA" = 'val1'"#
             ]
+        );
+    }
+
+    #[test]
+    fn test_view_format_title_sanitization() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: "Suspicious Process: cmd.exe /c (T1059.003)"
+logsource:
+    category: test
+detection:
+    selection:
+        FieldA: val1
+    condition: selection
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let queries = backend
+            .convert_rule(&collection.rules[0], "view", &PipelineState::default())
+            .unwrap();
+        assert!(
+            queries[0].starts_with(
+                "CREATE OR REPLACE VIEW sigma_suspicious_process_cmdexe_c_t1059003 AS"
+            )
         );
     }
 
@@ -1564,7 +1647,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "Path" ILIKE '100\%'"#]
+            vec![r#"SELECT * FROM security_events WHERE "Path" ILIKE '%100\%%'"#]
         );
     }
 
@@ -1885,7 +1968,7 @@ correlation:
             )
             .unwrap();
         assert_eq!(queries.len(), 1);
-        // No UNION ALL — single table approach
+        // No UNION ALL, uses single table approach
         assert!(
             queries[0].contains("rule_name IN ('rule_a', 'rule_b')"),
             "expected single-table approach in: {}",
@@ -2121,7 +2204,7 @@ correlation:
         let backend = PostgresBackend::new();
         let mut pipeline_state = PipelineState::default();
 
-        // Both rules point to the same table — single-table path
+        // Both rules point to the same table so the single-table path is used
         let rule_tables = serde_json::json!({
             "rule_a": "security_events",
             "rule_b": "security_events"

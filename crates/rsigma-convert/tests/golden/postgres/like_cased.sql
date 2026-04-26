@@ -1,1 +1,1 @@
-SELECT * FROM security_events WHERE "CommandLine" LIKE 'Whoami'
+SELECT * FROM security_events WHERE "CommandLine" LIKE '%Whoami%'
