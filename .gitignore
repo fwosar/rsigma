@@ -11,3 +11,5 @@ editors/vscode/*.vsix
 *.pem
 *.key
 .cargo/credentials.toml
+.cursor/
+

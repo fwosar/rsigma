@@ -112,6 +112,9 @@ Run rsigma as a long-running daemon that continuously reads NDJSON from stdin, e
 
 Unlike `eval`, the daemon stays alive after stdin reaches EOF and supports hot-reload: adding, modifying, or removing `.yml`/`.yaml` files in the rules directory triggers an automatic reload. SIGHUP and the `/api/v1/reload` endpoint also trigger reloads. The daemon is designed for production deployment behind a log collector (e.g. `hel run | rsigma daemon ...`) or an event bus.
 
+> [!TIP]
+> Correlation rules also work in `eval` mode within a single run (via stdin or `@file`), but daemon mode is recommended for continuous stateful tracking with hot-reload and state persistence.
+
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--rules` / `-r` | path | required | Path to Sigma rule file or directory |
@@ -192,6 +195,9 @@ rsigma daemon \
 ### `eval`: Evaluate events against rules
 
 Evaluate JSON events against Sigma detection and correlation rules.
+
+> [!TIP]
+> Eval mode builds correlation state in memory for the duration of a single run, so correlation rules fire when multiple events are processed together (via stdin or `@file`). State is not persisted between runs. For continuous correlation over time, use `daemon` mode.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
