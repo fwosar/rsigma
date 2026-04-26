@@ -16,8 +16,18 @@ The crate provides a generic conversion framework that any backend can plug into
 - **Orchestrator** via `convert_collection()`, which applies pipelines, converts each rule, and collects results and errors.
 - **Deferred expressions** through the `DeferredExpression` trait and `DeferredTextExpression` for backends that need post-query appendages (e.g. Splunk `| regex`, `| where`).
 - **Test backend** with `TextQueryTestBackend` and `MandatoryPipelineTestBackend` for backend-neutral foundation testing.
+- **PostgreSQL/TimescaleDB backend** with native `ILIKE`, regex (`~*`), CIDR (`inet`/`cidr`), full-text search (`tsvector`/`tsquery`), JSONB field access, correlation via CTEs and window functions, and TimescaleDB-specific output formats (continuous aggregates, `time_bucket` queries, view generation).
+
+## Backends
+
+| Backend | Target names | Description |
+|---------|-------------|-------------|
+| Test | `test` | Backend-neutral text queries for foundation testing |
+| PostgreSQL | `postgres`, `postgresql`, `pg` | Native PostgreSQL SQL with TimescaleDB support |
 
 ## Usage
+
+### Test backend
 
 ```rust
 use rsigma_parser::parse_sigma_yaml;
@@ -47,6 +57,118 @@ for result in &output.queries {
     }
 }
 ```
+
+### PostgreSQL backend
+
+```rust
+use rsigma_parser::parse_sigma_yaml;
+use rsigma_convert::{convert_collection, Backend};
+use rsigma_convert::backends::postgres::PostgresBackend;
+
+let yaml = r#"
+title: Detect Whoami
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        CommandLine|contains: 'whoami'
+    condition: selection
+level: medium
+"#;
+
+let collection = parse_sigma_yaml(yaml).unwrap();
+let backend = PostgresBackend::new();
+
+let output = convert_collection(&backend, &collection, &[], "default").unwrap();
+for result in &output.queries {
+    for query in &result.queries {
+        println!("{query}");
+        // Output: SELECT * FROM security_events WHERE "CommandLine" ILIKE 'whoami'
+    }
+}
+```
+
+### PostgreSQL output formats
+
+| Format | Description |
+|--------|-------------|
+| `default` | Plain `SELECT * FROM {table} WHERE ...` queries |
+| `view` | `CREATE OR REPLACE VIEW sigma_{id} AS SELECT ...` |
+| `timescaledb` | Queries with `time_bucket()` for TimescaleDB optimization |
+| `continuous_aggregate` | `CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)` |
+
+### Custom table, schema, and database
+
+The target table and schema can be set at three levels (highest precedence first):
+
+1. **Rule-level `custom_attributes`** — `postgres.table`, `postgres.schema`, `postgres.database`
+2. **Pipeline state** — `set_state` with `key: table`, `key: schema`
+3. **Backend defaults** — `PostgresBackend.table`, `.schema`, `.database`
+
+Example rule with custom attributes:
+
+```yaml
+title: Process Creation
+logsource:
+    category: process_creation
+detection:
+    selection:
+        CommandLine|contains: 'whoami'
+    condition: selection
+custom_attributes:
+    postgres.table: process_events
+    postgres.schema: siem
+```
+
+### OCSF pipelines
+
+Two OCSF processing pipelines are included:
+
+| Pipeline | Description |
+|----------|-------------|
+| `pipelines/ocsf_postgres.yml` | Single-table — all events go to `security_events` |
+| `pipelines/ocsf_postgres_multi_table.yml` | Per-logsource routing — each category gets its own table (`process_events`, `network_events`, etc.) |
+
+```bash
+# Single-table pipeline
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml
+
+# Multi-table pipeline (per-logsource routing)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres_multi_table.yml
+
+# With output format
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml -f view
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml -f continuous_aggregate
+```
+
+### Multi-table temporal correlations
+
+When a temporal correlation rule references detection rules that target different tables (via per-logsource pipeline routing or custom attributes), the backend automatically generates a `UNION ALL` CTE:
+
+```sql
+-- Rules targeting different tables produce UNION ALL
+WITH matched AS (
+    SELECT *, 'process_rule' AS rule_name FROM process_events
+        WHERE time >= NOW() - INTERVAL '300 seconds'
+    UNION ALL
+    SELECT *, 'network_rule' AS rule_name FROM network_events
+        WHERE time >= NOW() - INTERVAL '300 seconds'
+)
+SELECT "User", COUNT(DISTINCT rule_name) AS distinct_rules,
+    MIN(time) AS first_seen, MAX(time) AS last_seen
+FROM matched
+GROUP BY "User"
+HAVING COUNT(DISTINCT rule_name) >= 2
+```
+
+When all referenced rules share the same table, the simpler single-table approach is used instead.
+
+Per-rule schemas are also tracked: if different detection rules set different schemas (via `postgres.schema` custom attribute or `set_state key: schema` in the pipeline), each leg of the UNION ALL uses the correct `schema.table`.
+
+### Reference schema
+
+A reference TimescaleDB schema is provided at [`schema/timescaledb_security_events.sql`](./schema/timescaledb_security_events.sql) with hypertable setup, indexes (B-tree, GIN for full-text and JSONB), compression, retention policies, and an example continuous aggregate.
 
 ## Backend Trait
 
@@ -93,7 +215,37 @@ For text-based query backends (the vast majority), create a `TextQueryConfig` wi
 3. Override specific methods for backend-specific behavior (e.g. deferred regex for Splunk, SQL-specific CIDR handling for PostgreSQL).
 4. Register your backend in the CLI's `get_backend()` registry.
 
-See `backends/test.rs` for a complete reference implementation.
+See `backends/test.rs` for a complete reference implementation and `backends/postgres.rs` for a production backend with SQL-specific overrides.
+
+## PostgreSQL Backend Details
+
+The PostgreSQL backend (`PostgresBackend`) leverages native PostgreSQL features that map cleanly to Sigma modifiers:
+
+| Sigma Modifier | PostgreSQL SQL |
+|----------------|---------------|
+| `contains` | `ILIKE` (case-insensitive) |
+| `startswith` / `endswith` | `ILIKE` |
+| `cased` | `LIKE` (case-sensitive) |
+| `re` | `~*` (case-insensitive regex) or `~` (with `cased`) |
+| `cidr` | `field::inet <<= 'value'::cidr` |
+| `exists` | `IS NOT NULL` / `IS NULL` |
+| keywords | `to_tsvector() @@ to_tsquery()` |
+
+Correlation rules are converted to SQL using `GROUP BY` / `HAVING` for aggregation types (`event_count`, `value_count`, `value_sum`, `value_avg`, `value_percentile`, `value_median`) and CTEs for temporal correlation. Multi-table temporal correlations automatically generate `UNION ALL` CTEs when referenced rules target different tables.
+
+### Configuration
+
+`PostgresBackend` fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `table` | `String` | `"security_events"` | Default table name (overridden by pipeline state or `postgres.table` custom attribute) |
+| `timestamp_field` | `String` | `"time"` | Timestamp column for time-windowed queries |
+| `json_field` | `Option<String>` | `None` | If set, fields are accessed via JSONB (`col->>'field'`) |
+| `case_sensitive_re` | `bool` | `false` | Use `~` instead of `~*` for regex |
+| `schema` | `Option<String>` | `None` | PostgreSQL schema name (overridden by pipeline state or `postgres.schema` custom attribute) |
+| `database` | `Option<String>` | `None` | PostgreSQL database name (connection-level metadata) |
+| `timescaledb` | `bool` | `false` | Enable TimescaleDB-specific features |
 
 ## License
 

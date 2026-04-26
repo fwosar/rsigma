@@ -30,6 +30,9 @@ rsigma eval -r rules/ -p pipelines/ecs.yml -e '{"process.command_line": "whoami"
 # Convert rules to backend-native queries
 rsigma convert -r rules/ -t test
 
+# Convert to PostgreSQL SQL
+rsigma convert -r rules/ -t postgres
+
 # List available conversion backends
 rsigma list-targets
 ```
@@ -291,6 +294,8 @@ Convert Sigma rules into query strings for a specific backend (SQL, SPL, KQL, Lu
 | `--pipeline` / `-p` | repeatable | `[]` | Processing pipeline YAML file(s) |
 | `--format` / `-f` | string | `"default"` | Output format (see `list-formats`) |
 
+Available backends: `test`, `postgres` (aliases: `postgresql`, `pg`).
+
 ```bash
 # Convert rules using the test backend
 rsigma convert -r rules/ -t test
@@ -300,6 +305,21 @@ rsigma convert -r rules/ -t test -p pipelines/ecs.yml -f state
 
 # Convert a single rule
 rsigma convert -r rule.yml -t test
+
+# Convert to PostgreSQL SQL
+rsigma convert -r rules/ -t postgres
+
+# Convert to PostgreSQL with OCSF field mapping (single table)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml
+
+# Convert with per-logsource table routing (multi-table)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres_multi_table.yml
+
+# Generate PostgreSQL views
+rsigma convert -r rules/ -t postgres -f view
+
+# Generate TimescaleDB continuous aggregates
+rsigma convert -r rules/ -t postgres -f continuous_aggregate
 ```
 
 ### `list-targets`: List available conversion backends
@@ -308,6 +328,9 @@ List all registered conversion backend targets.
 
 ```bash
 rsigma list-targets
+# Output:
+#   test      Backend-neutral text queries for testing
+#   postgres  PostgreSQL/TimescaleDB SQL
 ```
 
 ### `list-formats`: List output formats for a backend
@@ -319,7 +342,12 @@ List the output formats supported by a specific backend.
 | `--target` / `-t` | string | required | Backend target name |
 
 ```bash
-rsigma list-formats -t test
+rsigma list-formats -t postgres
+# Output:
+#   default              Plain PostgreSQL SQL
+#   view                 CREATE OR REPLACE VIEW for each rule
+#   timescaledb          TimescaleDB-optimized queries with time_bucket()
+#   continuous_aggregate CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)
 ```
 
 ### `condition`: Parse a condition expression

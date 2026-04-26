@@ -75,11 +75,26 @@ rsigma convert -r rules/ -t test
 # Convert with a processing pipeline and specific output format
 rsigma convert -r rules/ -t test -p pipelines/ecs.yml -f state
 
+# Convert to PostgreSQL SQL
+rsigma convert -r rules/ -t postgres
+
+# Convert to PostgreSQL with OCSF field mapping pipeline (single table)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml
+
+# Convert with per-logsource table routing (multi-table)
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres_multi_table.yml
+
+# Generate PostgreSQL views for each rule
+rsigma convert -r rules/ -t postgres -f view
+
+# Generate TimescaleDB continuous aggregates
+rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml -f continuous_aggregate
+
 # List available conversion backends
 rsigma list-targets
 
 # List available output formats for a backend
-rsigma list-formats -t test
+rsigma list-formats -t postgres
 ```
 
 Or use the library directly:
@@ -198,9 +213,9 @@ See [`examples/jsonl_stdin.rs`](crates/rsigma-runtime/examples/jsonl_stdin.rs) a
     │    Engine (stateless)   │   │                     │   │  VSCode, Neovim,   │
     │                         │   │  backends/ ──>      │   │  Helix, Zed, ...   │
     │  correlation.rs ──>     │   │    TextQueryTest,   │   └────────────────────┘
-    │    sliding windows,     │   │    (PostgreSQL WIP) │
-    │    group-by, chaining,  │   └─────────────────────┘
-    │    suppression, events  │
+    │    sliding windows,     │   │    PostgreSQL/      │
+    │    group-by, chaining,  │   │    TimescaleDB      │
+    │    suppression, events  │   └─────────────────────┘
     │                         │
     │  rsigma.* custom        │
     │    attributes           │
