@@ -233,6 +233,28 @@ impl PostgresBackend {
         result
     }
 
+    /// Add `%` wildcards to a LIKE value based on modifier semantics.
+    /// The value is already a quoted `'...'` string from `build_like_value`.
+    fn wrap_like_wildcards(
+        &self,
+        quoted: &str,
+        is_contains: bool,
+        is_startswith: bool,
+        is_endswith: bool,
+    ) -> String {
+        if !is_contains && !is_startswith && !is_endswith {
+            return quoted.to_string();
+        }
+        let inner = &quoted[1..quoted.len() - 1];
+        let prefix = if is_contains || is_endswith { "%" } else { "" };
+        let suffix = if is_contains || is_startswith {
+            "%"
+        } else {
+            ""
+        };
+        format!("'{prefix}{inner}{suffix}'")
+    }
+
     /// Build a plain SQL string literal from a SigmaString (no wildcards).
     fn build_plain_value(&self, value: &SigmaString) -> String {
         let plain = value.as_plain().unwrap_or_else(|| value.original.clone());
@@ -362,7 +384,8 @@ impl Backend for PostgresBackend {
         let like_op = if is_cased { "LIKE" } else { "ILIKE" };
 
         if is_contains || is_startswith || is_endswith || has_wildcards {
-            let val = self.build_like_value(value);
+            let inner = self.build_like_value(value);
+            let val = self.wrap_like_wildcards(&inner, is_contains, is_startswith, is_endswith);
             return Ok(ConvertResult::Query(format!("{f} {like_op} {val}")));
         }
 
@@ -1064,7 +1087,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE 'whoami'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE '%whoami%'"#]
         );
     }
 
@@ -1083,7 +1106,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE 'cmd'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE 'cmd%'"#]
         );
     }
 
@@ -1102,7 +1125,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE '.exe'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" ILIKE '%.exe'"#]
         );
     }
 
@@ -1121,7 +1144,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "CommandLine" LIKE 'Whoami'"#]
+            vec![r#"SELECT * FROM security_events WHERE "CommandLine" LIKE '%Whoami%'"#]
         );
     }
 
@@ -1581,7 +1604,7 @@ detection:
         );
         assert_eq!(
             queries,
-            vec![r#"SELECT * FROM security_events WHERE "Path" ILIKE '100\%'"#]
+            vec![r#"SELECT * FROM security_events WHERE "Path" ILIKE '%100\%%'"#]
         );
     }
 
