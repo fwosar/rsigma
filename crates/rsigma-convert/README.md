@@ -84,7 +84,7 @@ let output = convert_collection(&backend, &collection, &[], "default").unwrap();
 for result in &output.queries {
     for query in &result.queries {
         println!("{query}");
-        // Output: SELECT * FROM security_events WHERE "CommandLine" ILIKE 'whoami'
+        // Output: SELECT * FROM security_events WHERE "CommandLine" ILIKE '%whoami%'
     }
 }
 ```
@@ -102,9 +102,9 @@ for result in &output.queries {
 
 The target table and schema can be set at three levels (highest precedence first):
 
-1. **Rule-level `custom_attributes`** — `postgres.table`, `postgres.schema`, `postgres.database`
-2. **Pipeline state** — `set_state` with `key: table`, `key: schema`
-3. **Backend defaults** — `PostgresBackend.table`, `.schema`, `.database`
+1. **Rule-level `custom_attributes`**: `postgres.table`, `postgres.schema`, `postgres.database`
+2. **Pipeline state**: `set_state` with `key: table`, `key: schema`
+3. **Backend defaults**: `PostgresBackend.table`, `.schema`, `.database`
 
 Example rule with custom attributes:
 
@@ -127,8 +127,8 @@ Two OCSF processing pipelines are included:
 
 | Pipeline | Description |
 |----------|-------------|
-| `pipelines/ocsf_postgres.yml` | Single-table — all events go to `security_events` |
-| `pipelines/ocsf_postgres_multi_table.yml` | Per-logsource routing — each category gets its own table (`process_events`, `network_events`, etc.) |
+| `pipelines/ocsf_postgres.yml` | Single-table: all events go to `security_events` |
+| `pipelines/ocsf_postgres_multi_table.yml` | Per-logsource routing: each category gets its own table (`process_events`, `network_events`, etc.) |
 
 ```bash
 # Single-table pipeline

@@ -901,7 +901,7 @@ impl PostgresBackend {
         }
 
         if table_to_rules.len() <= 1 {
-            // Single table — filter by rule_name column
+            // Single table: filter by rule_name column
             let rule_names = rule.rules.join("', '");
             Ok(format!(
                 "WITH matched AS (\
@@ -917,7 +917,7 @@ impl PostgresBackend {
                  HAVING {having}"
             ))
         } else {
-            // Multi-table — UNION ALL CTE with one leg per rule
+            // Multi-table: UNION ALL CTE with one leg per rule
             let union_parts: Vec<String> = table_to_rules
                 .iter()
                 .flat_map(|(tbl, rules)| {
@@ -1968,7 +1968,7 @@ correlation:
             )
             .unwrap();
         assert_eq!(queries.len(), 1);
-        // No UNION ALL — single table approach
+        // No UNION ALL, uses single table approach
         assert!(
             queries[0].contains("rule_name IN ('rule_a', 'rule_b')"),
             "expected single-table approach in: {}",
@@ -2204,7 +2204,7 @@ correlation:
         let backend = PostgresBackend::new();
         let mut pipeline_state = PipelineState::default();
 
-        // Both rules point to the same table — single-table path
+        // Both rules point to the same table so the single-table path is used
         let rule_tables = serde_json::json!({
             "rule_a": "security_events",
             "rule_b": "security_events"

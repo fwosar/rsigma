@@ -47,7 +47,7 @@ pub enum TokenType {
 /// Backends implement this to convert parsed Sigma AST nodes into
 /// backend-native query strings. The trait operates on **parsed** types
 /// from `rsigma-parser` because conversion needs the original field names,
-/// modifiers, and values — not compiled matchers.
+/// modifiers, and values rather than compiled matchers.
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     fn formats(&self) -> &[(&str, &str)];
