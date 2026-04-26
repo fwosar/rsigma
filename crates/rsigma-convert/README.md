@@ -229,7 +229,7 @@ The PostgreSQL backend (`PostgresBackend`) leverages native PostgreSQL features 
 | `re` | `~*` (case-insensitive regex) or `~` (with `cased`) |
 | `cidr` | `field::inet <<= 'value'::cidr` |
 | `exists` | `IS NOT NULL` / `IS NULL` |
-| keywords | `to_tsvector() @@ to_tsquery()` |
+| keywords | `to_tsvector() @@ plainto_tsquery()` |
 
 Correlation rules are converted to SQL using `GROUP BY` / `HAVING` for aggregation types (`event_count`, `value_count`, `value_sum`, `value_avg`, `value_percentile`, `value_median`) and CTEs for temporal correlation. Multi-table temporal correlations automatically generate `UNION ALL` CTEs when referenced rules target different tables.
 

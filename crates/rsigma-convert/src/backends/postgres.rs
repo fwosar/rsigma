@@ -511,36 +511,27 @@ impl Backend for PostgresBackend {
     }
 
     fn convert_keyword(&self, value: &SigmaValue, _state: &mut ConversionState) -> Result<String> {
+        let search_target = match &self.json_field {
+            Some(json_col) => format!("{json_col}::text"),
+            None => "ROW(*)::text".to_string(),
+        };
         match value {
             SigmaValue::String(s) => {
                 let plain = s.as_plain().unwrap_or_else(|| s.original.clone());
+                if plain.is_empty() {
+                    return Err(ConvertError::UnsupportedKeyword);
+                }
                 let escaped = self.escape_sql_str(&plain);
-                let search_target = match &self.json_field {
-                    Some(json_col) => format!("{json_col}::text"),
-                    None => "ROW(*)::text".to_string(),
-                };
                 Ok(format!(
-                    "to_tsvector('simple', {search_target}) @@ to_tsquery('simple', '{escaped}')"
+                    "to_tsvector('simple', {search_target}) @@ plainto_tsquery('simple', '{escaped}')"
                 ))
             }
-            SigmaValue::Integer(n) => {
-                let search_target = match &self.json_field {
-                    Some(json_col) => format!("{json_col}::text"),
-                    None => "ROW(*)::text".to_string(),
-                };
-                Ok(format!(
-                    "to_tsvector('simple', {search_target}) @@ to_tsquery('simple', '{n}')"
-                ))
-            }
-            SigmaValue::Float(f) => {
-                let search_target = match &self.json_field {
-                    Some(json_col) => format!("{json_col}::text"),
-                    None => "ROW(*)::text".to_string(),
-                };
-                Ok(format!(
-                    "to_tsvector('simple', {search_target}) @@ to_tsquery('simple', '{f}')"
-                ))
-            }
+            SigmaValue::Integer(n) => Ok(format!(
+                "to_tsvector('simple', {search_target}) @@ plainto_tsquery('simple', '{n}')"
+            )),
+            SigmaValue::Float(f) => Ok(format!(
+                "to_tsvector('simple', {search_target}) @@ plainto_tsquery('simple', '{f}')"
+            )),
             _ => Err(ConvertError::UnsupportedKeyword),
         }
     }
@@ -1421,8 +1412,8 @@ detection:
             queries,
             vec![
                 "SELECT * FROM security_events WHERE \
-                 to_tsvector('simple', ROW(*)::text) @@ to_tsquery('simple', 'whoami') OR \
-                 to_tsvector('simple', ROW(*)::text) @@ to_tsquery('simple', 'ipconfig')"
+                 to_tsvector('simple', ROW(*)::text) @@ plainto_tsquery('simple', 'whoami') OR \
+                 to_tsvector('simple', ROW(*)::text) @@ plainto_tsquery('simple', 'ipconfig')"
             ]
         );
     }
