@@ -540,12 +540,16 @@ where
 {
     match detection {
         Detection::AllOf(items) => {
-            // Compute alternative-lists for every item up-front so we can
-            // detect whether a Cartesian expansion is needed before mutating.
-            let mut alternatives: Vec<Vec<DetectionItem>> = Vec::with_capacity(items.len());
-            let mut needs_expansion = false;
-            for item in items.iter() {
-                let alts = match item.field.name.as_deref() {
+            // First pass (read-only): resolve each item's mapping result.
+            // Store either a single rename or a multi-alternative expansion.
+            enum Resolved {
+                Unchanged,
+                Renamed(String),
+                Expanded(Vec<String>),
+            }
+            let resolved: Vec<Resolved> = items
+                .iter()
+                .map(|item| match item.field.name.as_deref() {
                     Some(name)
                         if field_conditions_match(
                             name,
@@ -555,37 +559,49 @@ where
                         ) =>
                     {
                         match transform_fn(name) {
-                            Some(new_names) if !new_names.is_empty() => {
-                                if new_names.len() > 1 {
-                                    needs_expansion = true;
-                                }
-                                new_names
-                                    .into_iter()
-                                    .map(|new_name| {
-                                        let mut clone = item.clone();
-                                        clone.field.name = Some(new_name);
-                                        clone
-                                    })
-                                    .collect()
+                            Some(new_names) if new_names.len() > 1 => Resolved::Expanded(new_names),
+                            Some(mut new_names) if new_names.len() == 1 => {
+                                Resolved::Renamed(new_names.pop().unwrap())
                             }
-                            // None or empty Vec — leave item untouched.
-                            _ => vec![item.clone()],
+                            _ => Resolved::Unchanged,
                         }
                     }
-                    _ => vec![item.clone()],
-                };
-                alternatives.push(alts);
-            }
+                    _ => Resolved::Unchanged,
+                })
+                .collect();
+
+            let needs_expansion = resolved.iter().any(|r| matches!(r, Resolved::Expanded(_)));
 
             if !needs_expansion {
-                // Fast path: every list has length 1, just unwrap and replace.
-                *items = alternatives
-                    .into_iter()
-                    .map(|mut alts| alts.pop().expect("non-empty by construction"))
-                    .collect();
+                // Fast path: apply 1:1 renames in-place, no cloning.
+                for (item, res) in items.iter_mut().zip(resolved) {
+                    if let Resolved::Renamed(new_name) = res {
+                        item.field.name = Some(new_name);
+                    }
+                }
             } else {
-                // Saturating multiply so a pathological mapping cannot overflow
-                // usize before we get a chance to reject it.
+                // Build per-item alternative lists for the Cartesian product.
+                let alternatives: Vec<Vec<DetectionItem>> = items
+                    .iter()
+                    .zip(resolved)
+                    .map(|(item, res)| match res {
+                        Resolved::Expanded(names) => names
+                            .into_iter()
+                            .map(|new_name| {
+                                let mut clone = item.clone();
+                                clone.field.name = Some(new_name);
+                                clone
+                            })
+                            .collect(),
+                        Resolved::Renamed(name) => {
+                            let mut clone = item.clone();
+                            clone.field.name = Some(name);
+                            vec![clone]
+                        }
+                        Resolved::Unchanged => vec![item.clone()],
+                    })
+                    .collect();
+
                 let total = alternatives
                     .iter()
                     .map(Vec::len)
