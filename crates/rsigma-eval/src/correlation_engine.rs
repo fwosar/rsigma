@@ -2666,7 +2666,7 @@ filter:
         - failed-auth
     selection:
         User|startswith: 'svc_'
-    condition: selection
+    condition: not selection
 ---
 title: Brute Force
 correlation:

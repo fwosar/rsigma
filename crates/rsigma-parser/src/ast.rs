@@ -597,6 +597,15 @@ pub struct CorrelationRule {
 // Filter Rule
 // =============================================================================
 
+/// Which rules a filter applies to.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum FilterRuleTarget {
+    /// The filter applies to every loaded rule.
+    Any,
+    /// The filter applies only to rules matching these IDs or titles.
+    Specific(Vec<String>),
+}
+
 /// A Sigma filter rule that modifies the detection logic of referenced rules.
 ///
 /// Filters add additional conditions (typically exclusions) to existing rules
@@ -622,8 +631,8 @@ pub struct FilterRule {
     pub scope: Vec<String>,
     pub logsource: Option<LogSource>,
 
-    /// Rules this filter applies to (by ID or name).
-    pub rules: Vec<String>,
+    /// Rules this filter applies to (by ID or name), or all rules.
+    pub rules: FilterRuleTarget,
     /// The filter detection section.
     pub detection: Detections,
 

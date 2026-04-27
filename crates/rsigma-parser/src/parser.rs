@@ -803,14 +803,22 @@ fn parse_filter_rule(value: &Value) -> Result<FilterRule> {
     let filter_mapping = filter_val.and_then(|v| v.as_mapping());
     let rules = match filter_mapping {
         Some(fm) => match fm.get(val_key("rules")) {
-            Some(Value::Sequence(seq)) => seq
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-            Some(Value::String(s)) => vec![s.clone()],
-            _ => Vec::new(),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("any") => FilterRuleTarget::Any,
+            Some(Value::String(s)) => FilterRuleTarget::Specific(vec![s.clone()]),
+            Some(Value::Sequence(seq)) => {
+                let list: Vec<String> = seq
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if list.is_empty() {
+                    FilterRuleTarget::Any
+                } else {
+                    FilterRuleTarget::Specific(list)
+                }
+            }
+            _ => FilterRuleTarget::Any,
         },
-        _ => Vec::new(),
+        _ => FilterRuleTarget::Any,
     };
 
     // Parse detection from filter.selection + filter.condition

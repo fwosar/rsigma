@@ -4,7 +4,9 @@
 //! against them. It supports optional logsource-based pre-filtering to
 //! reduce the number of rules evaluated per event.
 
-use rsigma_parser::{ConditionExpr, FilterRule, LogSource, SigmaCollection, SigmaRule};
+use rsigma_parser::{
+    ConditionExpr, FilterRule, FilterRuleTarget, LogSource, SigmaCollection, SigmaRule,
+};
 
 use crate::compiler::{CompiledRule, compile_detection, compile_rule, evaluate_rule};
 use crate::error::Result;
@@ -182,33 +184,38 @@ impl Engine {
         let fc = self.filter_counter;
         self.filter_counter += 1;
 
-        // Build the filter condition expression: AND of all filter detections
-        // Keys are namespaced with the filter counter to avoid collisions when
-        // multiple filters share detection names (e.g. both use "selection").
-        let filter_cond = if filter_detections.len() == 1 {
-            ConditionExpr::Identifier(format!("__filter_{fc}_{}", filter_detections[0].0))
+        // Rewrite the filter's own condition expression with namespaced identifiers
+        // so that `selection` becomes `__filter_0_selection`, etc.
+        let rewritten_cond = if let Some(cond_expr) = filter.detection.conditions.first() {
+            rewrite_condition_identifiers(cond_expr, fc)
         } else {
-            ConditionExpr::And(
-                filter_detections
-                    .iter()
-                    .map(|(name, _)| ConditionExpr::Identifier(format!("__filter_{fc}_{name}")))
-                    .collect(),
-            )
+            // No explicit condition: AND all detections (legacy fallback)
+            if filter_detections.len() == 1 {
+                ConditionExpr::Identifier(format!("__filter_{fc}_{}", filter_detections[0].0))
+            } else {
+                ConditionExpr::And(
+                    filter_detections
+                        .iter()
+                        .map(|(name, _)| ConditionExpr::Identifier(format!("__filter_{fc}_{name}")))
+                        .collect(),
+                )
+            }
         };
 
         // Find and modify referenced rules
         let mut matched_any = false;
         for rule in &mut self.rules {
-            let rule_matches = filter.rules.is_empty() // empty = applies to all
-                || filter.rules.iter().any(|r| {
-                    rule.id.as_deref() == Some(r.as_str())
-                        || rule.title == *r
-                });
+            let rule_matches = match &filter.rules {
+                FilterRuleTarget::Any => true,
+                FilterRuleTarget::Specific(refs) => refs
+                    .iter()
+                    .any(|r| rule.id.as_deref() == Some(r.as_str()) || rule.title == *r),
+            };
 
             // Also check logsource compatibility if the filter specifies one
             if rule_matches {
                 if let Some(ref filter_ls) = filter.logsource
-                    && !logsource_compatible(&rule.logsource, filter_ls)
+                    && !filter_logsource_contains(filter_ls, &rule.logsource)
                 {
                     continue;
                 }
@@ -219,22 +226,19 @@ impl Engine {
                         .insert(format!("__filter_{fc}_{name}"), compiled.clone());
                 }
 
-                // Wrap each existing condition: original AND NOT filter
+                // Wrap each existing rule condition with the filter condition
                 rule.conditions = rule
                     .conditions
                     .iter()
-                    .map(|cond| {
-                        ConditionExpr::And(vec![
-                            cond.clone(),
-                            ConditionExpr::Not(Box::new(filter_cond.clone())),
-                        ])
-                    })
+                    .map(|cond| ConditionExpr::And(vec![cond.clone(), rewritten_cond.clone()]))
                     .collect();
                 matched_any = true;
             }
         }
 
-        if !filter.rules.is_empty() && !matched_any {
+        if let FilterRuleTarget::Specific(_) = &filter.rules
+            && !matched_any
+        {
             log::warn!(
                 "filter '{}' references rules {:?} but none matched any loaded rule",
                 filter.title,
@@ -335,21 +339,53 @@ impl Default for Engine {
 /// The rule matches if every non-`None` field in the rule's logsource has
 /// the same value in the event's logsource. Fields the rule doesn't specify
 /// are ignored (wildcard).
-/// Symmetric compatibility check: two logsources are compatible if every field
-/// that *both* specify has the same value (case-insensitive). Fields that only
-/// one side specifies are ignored — e.g. a filter with `product: windows` is
-/// compatible with a rule that has `category: process_creation, product: windows`.
-fn logsource_compatible(a: &LogSource, b: &LogSource) -> bool {
-    fn field_compatible(a: &Option<String>, b: &Option<String>) -> bool {
-        match (a, b) {
-            (Some(va), Some(vb)) => va.eq_ignore_ascii_case(vb),
-            _ => true, // one or both unspecified — no conflict
+/// Asymmetric containment check for filter-to-rule matching: every field the
+/// filter specifies must be present and equal in the rule. Fields the filter
+/// omits are treated as wildcards (match any rule). This means a filter with
+/// only `product: windows` applies to rules that have `product: windows`
+/// regardless of their category/service, but a filter with
+/// `category: process_creation` does NOT apply to a rule that lacks a category.
+fn filter_logsource_contains(filter_ls: &LogSource, rule_ls: &LogSource) -> bool {
+    fn field_matches(filter_field: &Option<String>, rule_field: &Option<String>) -> bool {
+        match filter_field {
+            None => true,
+            Some(fv) => match rule_field {
+                Some(rv) => fv.eq_ignore_ascii_case(rv),
+                None => false,
+            },
         }
     }
 
-    field_compatible(&a.category, &b.category)
-        && field_compatible(&a.product, &b.product)
-        && field_compatible(&a.service, &b.service)
+    field_matches(&filter_ls.category, &rule_ls.category)
+        && field_matches(&filter_ls.product, &rule_ls.product)
+        && field_matches(&filter_ls.service, &rule_ls.service)
+}
+
+/// Rewrite all `Identifier` nodes in a condition expression tree, prefixing
+/// each name with `__filter_{counter}_` so it references the namespaced
+/// detection keys injected into the target rule.
+fn rewrite_condition_identifiers(expr: &ConditionExpr, counter: usize) -> ConditionExpr {
+    match expr {
+        ConditionExpr::Identifier(name) => {
+            ConditionExpr::Identifier(format!("__filter_{counter}_{name}"))
+        }
+        ConditionExpr::And(children) => ConditionExpr::And(
+            children
+                .iter()
+                .map(|c| rewrite_condition_identifiers(c, counter))
+                .collect(),
+        ),
+        ConditionExpr::Or(children) => ConditionExpr::Or(
+            children
+                .iter()
+                .map(|c| rewrite_condition_identifiers(c, counter))
+                .collect(),
+        ),
+        ConditionExpr::Not(child) => {
+            ConditionExpr::Not(Box::new(rewrite_condition_identifiers(child, counter)))
+        }
+        ConditionExpr::Selector { .. } => expr.clone(),
+    }
 }
 
 /// Asymmetric check: every field specified in `rule_ls` must be present and
@@ -573,7 +609,7 @@ filter:
         - rule-001
     selection:
         User: 'SYSTEM'
-    condition: selection
+    condition: not selection
 "#;
         let collection = parse_sigma_yaml(yaml).unwrap();
         assert_eq!(collection.rules.len(), 1);
@@ -611,7 +647,7 @@ filter:
     rules: []
     selection:
         Environment: 'test'
-    condition: selection
+    condition: not selection
 "#;
         let collection = parse_sigma_yaml(yaml).unwrap();
         let mut engine = Engine::new();
@@ -683,7 +719,7 @@ filter:
         - Detect Mimikatz
     selection:
         ParentImage|endswith: '\admin_toolkit.exe'
-    condition: selection
+    condition: not selection
 "#;
         let collection = parse_sigma_yaml(yaml).unwrap();
         let mut engine = Engine::new();
@@ -702,7 +738,7 @@ filter:
 
     #[test]
     fn test_filter_multiple_detections() {
-        // Filter with multiple detection items (AND)
+        // Filter with multiple detection items (AND exclusion)
         let yaml = r#"
 title: Suspicious Network
 id: net-001
@@ -722,7 +758,7 @@ filter:
         DestinationIp|startswith: '10.'
     trusted_user:
         User: 'svc_account'
-    condition: trusted_dst and trusted_user
+    condition: not (trusted_dst and trusted_user)
 "#;
         let collection = parse_sigma_yaml(yaml).unwrap();
         let mut engine = Engine::new();
@@ -772,7 +808,7 @@ filter:
     rules: []
     selection:
         Environment: 'test'
-    condition: selection
+    condition: not selection
 "#;
         let collection = parse_sigma_yaml(yaml).unwrap();
         let mut engine = Engine::new();
