@@ -242,12 +242,66 @@ fn apply_correlation_transformation(
 ) -> Result<bool> {
     match transformation {
         Transformation::FieldNameMapping { mapping } => {
-            // Correlation fields (group_by, aliases mapping values, threshold
-            // field) are scalar — OR over multiple alternatives isn't
-            // expressible there, so we use the first listed alternative.
-            remap_correlation_fields(corr, |name| {
-                mapping.get(name).and_then(|alts| alts.first().cloned())
-            });
+            // Match pySigma's FieldMappingTransformationBase.apply() for
+            // correlation rules: group_by expands all alternatives, while
+            // aliases and threshold field reject one-to-many mappings.
+            let alias_names: std::collections::HashSet<String> =
+                corr.aliases.iter().map(|a| a.alias.clone()).collect();
+
+            // aliases: error if any mapping value has multiple alternatives
+            for alias in &mut corr.aliases {
+                for (rule_ref, field_name) in &mut alias.mapping {
+                    if let Some(alts) = mapping.get(field_name.as_str())
+                        && alts.len() > 1
+                    {
+                        return Err(EvalError::InvalidModifiers(format!(
+                            "field_name_mapping one-to-many cannot be applied to \
+                             correlation alias mapping (alias '{}', rule '{}', \
+                             field '{}' maps to {} alternatives)",
+                            alias.alias,
+                            rule_ref,
+                            field_name,
+                            alts.len(),
+                        )));
+                    } else if let Some(alts) = mapping.get(field_name.as_str()) {
+                        *field_name = alts[0].clone();
+                    }
+                }
+            }
+
+            // group_by: expand all alternatives (skip alias names)
+            corr.group_by = corr
+                .group_by
+                .iter()
+                .flat_map(|field_name| {
+                    if alias_names.contains(field_name.as_str()) {
+                        vec![field_name.clone()]
+                    } else if let Some(alts) = mapping.get(field_name.as_str()) {
+                        alts.clone()
+                    } else {
+                        vec![field_name.clone()]
+                    }
+                })
+                .collect();
+
+            // threshold field: error if multiple alternatives
+            if let rsigma_parser::CorrelationCondition::Threshold { ref mut field, .. } =
+                corr.condition
+                && let Some(f) = field.as_ref()
+                && let Some(alts) = mapping.get(f.as_str())
+            {
+                if alts.len() > 1 {
+                    return Err(EvalError::InvalidModifiers(format!(
+                        "field_name_mapping one-to-many cannot be applied to \
+                         correlation condition field reference ('{}' maps to \
+                         {} alternatives)",
+                        f,
+                        alts.len(),
+                    )));
+                }
+                *field = Some(alts[0].clone());
+            }
+
             Ok(true)
         }
 
@@ -1038,10 +1092,21 @@ fn parse_string_or_list_mapping(
             if let Some(key) = k.as_str() {
                 let values = match v {
                     serde_yaml::Value::String(s) => vec![s.clone()],
-                    serde_yaml::Value::Sequence(seq) => seq
-                        .iter()
-                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                        .collect(),
+                    serde_yaml::Value::Sequence(seq) => {
+                        let mut strings = Vec::with_capacity(seq.len());
+                        for item in seq {
+                            if let Some(s) = item.as_str() {
+                                strings.push(s.to_string());
+                            } else {
+                                log::warn!(
+                                    "non-string item in mapping list for key '{}': {:?}; skipping",
+                                    key,
+                                    item,
+                                );
+                            }
+                        }
+                        strings
+                    }
                     _ => continue,
                 };
                 if !values.is_empty() {
@@ -1930,6 +1995,90 @@ transformations:
 
         assert_eq!(corr.group_by, vec!["source.ip", "destination.ip"]);
         assert_eq!(corr.aliases[0].mapping["rule_a"], "source.ip");
+    }
+
+    #[test]
+    fn test_correlation_field_mapping_group_by_expands_all_alternatives() {
+        let yaml = r#"
+name: Multi-field
+transformations:
+  - type: field_name_mapping
+    mapping:
+      DestinationIP:
+        - dst.ip
+        - dest.address
+      SourceIP: src.ip
+    rule_conditions:
+      - type: is_sigma_correlation_rule
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+        let mut corr = make_test_correlation();
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        pipeline
+            .apply_to_correlation(&mut corr, &mut state)
+            .unwrap();
+
+        // SourceIP is 1:1 (and also in an alias), DestinationIP expands
+        assert_eq!(
+            corr.group_by,
+            vec!["src.ip", "dst.ip", "dest.address"],
+            "group_by should expand all alternatives for DestinationIP"
+        );
+        // alias SourceIP should be remapped 1:1
+        assert_eq!(corr.aliases[0].mapping["rule_a"], "src.ip");
+    }
+
+    #[test]
+    fn test_correlation_field_mapping_alias_rejects_one_to_many() {
+        let yaml = r#"
+name: Alias conflict
+transformations:
+  - type: field_name_mapping
+    mapping:
+      SourceIP:
+        - src.ip
+        - source.address
+    rule_conditions:
+      - type: is_sigma_correlation_rule
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+        let mut corr = make_test_correlation();
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        let err = pipeline
+            .apply_to_correlation(&mut corr, &mut state)
+            .expect_err("alias with one-to-many must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("alias"), "error should mention alias: {msg}");
+    }
+
+    #[test]
+    fn test_correlation_field_mapping_threshold_field_rejects_one_to_many() {
+        let yaml = r#"
+name: Threshold conflict
+transformations:
+  - type: field_name_mapping
+    mapping:
+      UserName:
+        - user.name
+        - user.id
+    rule_conditions:
+      - type: is_sigma_correlation_rule
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+        let mut corr = make_test_correlation();
+        corr.condition = rsigma_parser::CorrelationCondition::Threshold {
+            predicates: vec![(rsigma_parser::ConditionOperator::Gte, 5)],
+            field: Some("UserName".to_string()),
+        };
+        let mut state = PipelineState::new(pipeline.vars.clone());
+        let err = pipeline
+            .apply_to_correlation(&mut corr, &mut state)
+            .expect_err("threshold field with one-to-many must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("condition field reference"),
+            "error should mention condition field: {msg}"
+        );
     }
 
     #[test]
