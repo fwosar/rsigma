@@ -62,9 +62,9 @@ pub mod value;
 // Re-export the most commonly used types and functions at crate root
 pub use ast::{
     ConditionExpr, ConditionOperator, CorrelationCondition, CorrelationRule, CorrelationType,
-    Detection, DetectionItem, Detections, FieldAlias, FieldSpec, FilterRule, Level, LogSource,
-    Modifier, Quantifier, Related, RelationType, SelectorPattern, SigmaCollection, SigmaDocument,
-    SigmaRule, Status,
+    Detection, DetectionItem, Detections, FieldAlias, FieldSpec, FilterRule, FilterRuleTarget,
+    Level, LogSource, Modifier, Quantifier, Related, RelationType, SelectorPattern,
+    SigmaCollection, SigmaDocument, SigmaRule, Status,
 };
 pub use condition::parse_condition;
 pub use error::{Result, SigmaParserError, SourceLocation};

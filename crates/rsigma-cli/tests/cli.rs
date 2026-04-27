@@ -110,7 +110,7 @@ filter:
         - 00000000-0000-0000-0000-000000000020
     selection:
         TargetFilename|endswith: "\\trusted.exe"
-    condition: selection
+    condition: not selection
 "#;
 
 const PIPELINE_YAML: &str = r#"

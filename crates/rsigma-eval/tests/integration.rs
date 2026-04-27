@@ -376,7 +376,7 @@ filter:
     rules: []
     env_match:
         Environment: test
-    condition: env_match
+    condition: not env_match
 ---
 title: Targeted Filter
 filter:
@@ -384,7 +384,7 @@ filter:
         - rule-a
     svc_match:
         User: svc_account
-    condition: svc_match
+    condition: not svc_match
 "#;
     let collection = parse_sigma_yaml(yaml).unwrap();
     let mut engine = Engine::new();
@@ -428,7 +428,7 @@ filter:
         - rule-a
     selection:
         Environment: test
-    condition: selection
+    condition: not selection
 ---
 title: Filter User
 filter:
@@ -436,7 +436,7 @@ filter:
         - rule-a
     selection:
         User: bot
-    condition: selection
+    condition: not selection
 "#;
     let collection = parse_sigma_yaml(yaml).unwrap();
     let mut engine = Engine::new();

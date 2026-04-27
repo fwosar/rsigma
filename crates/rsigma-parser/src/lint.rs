@@ -541,7 +541,14 @@ const VALID_STATUSES: &[&str] = &[
 const VALID_LEVELS: &[&str] = &["informational", "low", "medium", "high", "critical"];
 
 /// Valid related types.
-const VALID_RELATED_TYPES: &[&str] = &["derived", "obsolete", "merged", "renamed", "similar"];
+const VALID_RELATED_TYPES: &[&str] = &[
+    "correlation",
+    "derived",
+    "obsolete",
+    "merged",
+    "renamed",
+    "similar",
+];
 
 /// Valid correlation types.
 const VALID_CORRELATION_TYPES: &[&str] = &[
@@ -603,14 +610,31 @@ const KNOWN_KEYS_DETECTION: &[&str] = &[
 /// Extra top-level keys valid for correlation rules.
 const KNOWN_KEYS_CORRELATION: &[&str] = &[
     "correlation",
-    "level",
-    "generate",
-    "falsepositives",
     "custom_attributes",
+    "falsepositives",
+    "fields",
+    "generate",
+    "level",
+    "license",
+    "related",
+    "scope",
 ];
 
 /// Extra top-level keys valid for filter rules.
-const KNOWN_KEYS_FILTER: &[&str] = &["logsource", "filter"];
+const KNOWN_KEYS_FILTER: &[&str] = &[
+    "custom_attributes",
+    "falsepositives",
+    "fields",
+    "filter",
+    "level",
+    "license",
+    "logsource",
+    "references",
+    "related",
+    "scope",
+    "tags",
+    "taxonomy",
+];
 
 /// Tag pattern: `^[a-z0-9_-]+\.[a-z0-9._-]+$`
 fn is_valid_tag(s: &str) -> bool {
@@ -1632,22 +1656,21 @@ fn lint_filter_rule(m: &serde_yaml::Mapping, warnings: &mut Vec<LintWarning>) {
     };
 
     // ── filter.rules ─────────────────────────────────────────────────────
+    // `rules` is optional: omitted means "apply to all rules".
+    // Valid forms: a sequence of rule IDs/names, the string "any", or omitted.
     if let Some(rules_val) = filter.get(key("rules")) {
-        if let Some(seq) = rules_val.as_sequence()
-            && seq.is_empty()
-        {
-            warnings.push(warning(
-                LintRule::EmptyFilterRules,
-                "filter.rules should have at least one entry",
-                "/filter/rules",
-            ));
+        match rules_val {
+            serde_yaml::Value::Sequence(_) => {}
+            serde_yaml::Value::String(s) if s.eq_ignore_ascii_case("any") => {}
+            serde_yaml::Value::String(_) => {}
+            _ => {
+                warnings.push(err(
+                    LintRule::MissingFilterRules,
+                    "filter.rules must be a sequence of rule IDs, a single rule ID string, or 'any'",
+                    "/filter/rules",
+                ));
+            }
         }
-    } else {
-        warnings.push(err(
-            LintRule::MissingFilterRules,
-            "missing required field 'filter.rules'",
-            "/filter/rules",
-        ));
     }
 
     // ── filter.selection ─────────────────────────────────────────────────
@@ -3028,7 +3051,7 @@ filter:
     }
 
     #[test]
-    fn missing_filter_rules() {
+    fn filter_without_rules_is_valid() {
         let w = lint(
             r#"
 title: Test
@@ -3040,7 +3063,58 @@ filter:
     condition: selection
 "#,
         );
+        assert!(!has_rule(&w, LintRule::MissingFilterRules));
+    }
+
+    #[test]
+    fn filter_rules_invalid_type() {
+        let w = lint(
+            r#"
+title: Test
+logsource:
+    category: test
+filter:
+    rules: 123
+    selection:
+        User: admin
+    condition: selection
+"#,
+        );
         assert!(has_rule(&w, LintRule::MissingFilterRules));
+    }
+
+    #[test]
+    fn filter_rules_any_string_is_valid() {
+        let w = lint(
+            r#"
+title: Test
+logsource:
+    category: test
+filter:
+    rules: any
+    selection:
+        User: admin
+    condition: selection
+"#,
+        );
+        assert!(!has_rule(&w, LintRule::MissingFilterRules));
+    }
+
+    #[test]
+    fn filter_rules_empty_sequence_is_valid() {
+        let w = lint(
+            r#"
+title: Test
+logsource:
+    category: test
+filter:
+    rules: []
+    selection:
+        User: admin
+    condition: selection
+"#,
+        );
+        assert!(!has_rule(&w, LintRule::EmptyFilterRules));
     }
 
     #[test]
