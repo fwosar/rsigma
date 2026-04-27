@@ -33,9 +33,10 @@ pub enum Transformation {
     /// the rule's original AND structure across the rest of the items in the
     /// same selection via a Cartesian expansion.
     ///
-    /// Correlation rules use only the first alternative for `group_by`,
-    /// `aliases` mapping values, and threshold `field` (these positions are
-    /// inherently scalar; OR semantics aren't expressible there).
+    /// For correlation rules, `group_by` fields are expanded to include all
+    /// alternatives (alias names are left untouched). `aliases` mapping values
+    /// and threshold `field` reject one-to-many mappings with an error since
+    /// those positions are inherently scalar.
     FieldNameMapping {
         mapping: HashMap<String, Vec<String>>,
     },
