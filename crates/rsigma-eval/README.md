@@ -258,7 +258,7 @@ Each transformation item in a pipeline can have:
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `field_name_mapping` | `mapping: {k: v}` | Rename fields via a mapping dict |
+| `field_name_mapping` | `mapping: {k: v \| [v1, v2, ...]}` | Rename fields via a mapping dict; list values expand the matched detection item into an OR over the alternatives (one-to-many, pySigma-compatible) |
 | `field_name_prefix_mapping` | `mapping: {prefix: replacement}` | Rename fields matching a prefix |
 | `field_name_prefix` | `prefix` | Add a prefix to all field names |
 | `field_name_suffix` | `suffix` | Add a suffix to all field names |
@@ -436,6 +436,29 @@ engine.add_collection(&collection).unwrap();
 let event = JsonEvent::borrow(&json!({"process.command_line": "whoami"}));
 let matches = engine.evaluate(&event);
 ```
+
+`field_name_mapping` also accepts a list of alternatives, matching pySigma's
+`FieldMappingTransformation`. The matched detection item is expanded into an
+OR over the alternatives — when the surrounding `AllOf` selection has other
+items, they're preserved across each branch via a Cartesian expansion so the
+`AND` / `OR` semantics stay correct:
+
+```yaml
+name: Hashes mapping
+transformations:
+  - type: field_name_mapping
+    mapping:
+      Hashes:
+        - file.hash.md5
+        - file.hash.sha1
+        - file.hash.sha256
+```
+
+After applying this pipeline, a rule selecting `Hashes: 'abc123'` matches an
+event populating *any* of `file.hash.md5`, `file.hash.sha1`, or
+`file.hash.sha256`. Correlation rules (`group_by`, `aliases`, threshold
+`field`) consume only the first listed alternative since those positions are
+inherently scalar.
 
 **With correlations:**
 

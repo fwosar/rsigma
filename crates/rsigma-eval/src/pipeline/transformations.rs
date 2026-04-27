@@ -25,7 +25,20 @@ use crate::error::{EvalError, Result};
 #[derive(Debug, Clone)]
 pub enum Transformation {
     /// Map field names via a lookup table.
-    FieldNameMapping { mapping: HashMap<String, String> },
+    ///
+    /// Supports pySigma-compatible one-to-many mapping: a single source name
+    /// can map to a list of alternative field names. When more than one
+    /// alternative is present, the matched detection item is replaced with
+    /// an OR-conjunction (`AnyOf`) of items, one per alternative — preserving
+    /// the rule's original AND structure across the rest of the items in the
+    /// same selection via a Cartesian expansion.
+    ///
+    /// Correlation rules use only the first alternative for `group_by`,
+    /// `aliases` mapping values, and threshold `field` (these positions are
+    /// inherently scalar; OR semantics aren't expressible there).
+    FieldNameMapping {
+        mapping: HashMap<String, Vec<String>>,
+    },
 
     /// Map field name prefixes.
     FieldNamePrefixMapping { mapping: HashMap<String, String> },
@@ -174,7 +187,7 @@ impl Transformation {
                     field_name_conditions,
                     field_name_cond_not,
                     |name| mapping.get(name).cloned(),
-                );
+                )?;
                 Ok(true)
             }
 
@@ -187,12 +200,16 @@ impl Transformation {
                     |name| {
                         for (prefix, replacement) in mapping {
                             if name.starts_with(prefix.as_str()) {
-                                return Some(format!("{}{}", replacement, &name[prefix.len()..]));
+                                return Some(vec![format!(
+                                    "{}{}",
+                                    replacement,
+                                    &name[prefix.len()..]
+                                )]);
                             }
                         }
                         None
                     },
-                );
+                )?;
                 Ok(true)
             }
 
@@ -202,8 +219,8 @@ impl Transformation {
                     state,
                     field_name_conditions,
                     field_name_cond_not,
-                    |name| Some(format!("{prefix}{name}")),
-                );
+                    |name| Some(vec![format!("{prefix}{name}")]),
+                )?;
                 Ok(true)
             }
 
@@ -213,8 +230,8 @@ impl Transformation {
                     state,
                     field_name_conditions,
                     field_name_cond_not,
-                    |name| Some(format!("{name}{suffix}")),
-                );
+                    |name| Some(vec![format!("{name}{suffix}")]),
+                )?;
                 Ok(true)
             }
 
@@ -328,11 +345,11 @@ impl Transformation {
                     field_name_cond_not,
                     |name| {
                         if let Some(mapped) = map.get(name) {
-                            return Some(mapped.clone());
+                            return Some(vec![mapped.clone()]);
                         }
-                        Some(apply_named_string_fn(&func, name))
+                        Some(vec![apply_named_string_fn(&func, name)])
                     },
-                );
+                )?;
                 Ok(true)
             }
 
@@ -468,15 +485,35 @@ impl Transformation {
 // Field name transformation helper
 // =============================================================================
 
+/// Max branches a single one-to-many field-name expansion can produce inside
+/// one `AllOf`.
+///
+/// The Cartesian product of per-item alternative lists grows fast
+/// (e.g. 10 items * 5 alternatives each = ~9.7M branches). pySigma
+/// materializes expanded rules once for query generation, but rsigma
+/// evaluates rules against live events, so a blown-up detection tree stays
+/// in the hot path permanently. We reject expansions above this threshold at
+/// load time instead of silently ballooning memory and CPU.
+const MAX_FIELD_MAPPING_COMBINATIONS: usize = 4096;
+
+/// Apply a field-name-rewriting closure to every detection in `rule`.
+///
+/// The closure returns `None` to leave a name untouched, `Some(vec)` to
+/// rewrite it. A single-element `Some` renames the item in place. Multiple
+/// alternatives expand the matched item into an OR over the alternatives;
+/// the surrounding `AllOf` becomes an `AnyOf` of `AllOf`s via Cartesian
+/// expansion (see `transform_detection_fields`).
 fn apply_field_name_transform<F>(
     rule: &mut SigmaRule,
     state: &PipelineState,
     field_name_conditions: &[FieldNameCondition],
     field_name_cond_not: bool,
     transform_fn: F,
-) where
-    F: Fn(&str) -> Option<String>,
+) -> Result<()>
+where
+    F: Fn(&str) -> Option<Vec<String>>,
 {
+    let rule_title = rule.title.clone();
     for detection in rule.detection.named.values_mut() {
         transform_detection_fields(
             detection,
@@ -484,8 +521,10 @@ fn apply_field_name_transform<F>(
             field_name_conditions,
             field_name_cond_not,
             &transform_fn,
-        );
+            &rule_title,
+        )?;
     }
+    Ok(())
 }
 
 fn transform_detection_fields<F>(
@@ -494,23 +533,75 @@ fn transform_detection_fields<F>(
     field_name_conditions: &[FieldNameCondition],
     field_name_cond_not: bool,
     transform_fn: &F,
-) where
-    F: Fn(&str) -> Option<String>,
+    rule_title: &str,
+) -> Result<()>
+where
+    F: Fn(&str) -> Option<Vec<String>>,
 {
     match detection {
         Detection::AllOf(items) => {
-            for item in items.iter_mut() {
-                if let Some(ref name) = item.field.name
-                    && field_conditions_match(
-                        name,
-                        state,
-                        field_name_conditions,
-                        field_name_cond_not,
-                    )
-                    && let Some(new_name) = transform_fn(name)
-                {
-                    item.field.name = Some(new_name);
+            // Compute alternative-lists for every item up-front so we can
+            // detect whether a Cartesian expansion is needed before mutating.
+            let mut alternatives: Vec<Vec<DetectionItem>> = Vec::with_capacity(items.len());
+            let mut needs_expansion = false;
+            for item in items.iter() {
+                let alts = match item.field.name.as_deref() {
+                    Some(name)
+                        if field_conditions_match(
+                            name,
+                            state,
+                            field_name_conditions,
+                            field_name_cond_not,
+                        ) =>
+                    {
+                        match transform_fn(name) {
+                            Some(new_names) if !new_names.is_empty() => {
+                                if new_names.len() > 1 {
+                                    needs_expansion = true;
+                                }
+                                new_names
+                                    .into_iter()
+                                    .map(|new_name| {
+                                        let mut clone = item.clone();
+                                        clone.field.name = Some(new_name);
+                                        clone
+                                    })
+                                    .collect()
+                            }
+                            // None or empty Vec — leave item untouched.
+                            _ => vec![item.clone()],
+                        }
+                    }
+                    _ => vec![item.clone()],
+                };
+                alternatives.push(alts);
+            }
+
+            if !needs_expansion {
+                // Fast path: every list has length 1, just unwrap and replace.
+                *items = alternatives
+                    .into_iter()
+                    .map(|mut alts| alts.pop().expect("non-empty by construction"))
+                    .collect();
+            } else {
+                // Saturating multiply so a pathological mapping cannot overflow
+                // usize before we get a chance to reject it.
+                let total = alternatives
+                    .iter()
+                    .map(Vec::len)
+                    .fold(1usize, |acc, n| acc.saturating_mul(n));
+                if total > MAX_FIELD_MAPPING_COMBINATIONS {
+                    let sizes: Vec<usize> = alternatives.iter().map(Vec::len).collect();
+                    return Err(EvalError::InvalidModifiers(format!(
+                        "field name mapping cartesian expansion would produce {total} \
+                         branches, exceeding the limit of {MAX_FIELD_MAPPING_COMBINATIONS} \
+                         (rule: {rule_title}, per-item alternative counts: {sizes:?}); \
+                         reduce the number of one-to-many alternatives or split the AllOf"
+                    )));
                 }
+                let combinations = cartesian_product(alternatives);
+                *detection =
+                    Detection::AnyOf(combinations.into_iter().map(Detection::AllOf).collect());
             }
         }
         Detection::AnyOf(subs) => {
@@ -521,11 +612,34 @@ fn transform_detection_fields<F>(
                     field_name_conditions,
                     field_name_cond_not,
                     transform_fn,
-                );
+                    rule_title,
+                )?;
             }
         }
         Detection::Keywords(_) => {}
     }
+    Ok(())
+}
+
+/// Build the Cartesian product of a sequence of alternative lists.
+///
+/// `[[a, b], [c]]` → `[[a, c], [b, c]]`.
+/// Empty input yields a single empty combination so callers handle the edge
+/// case uniformly.
+fn cartesian_product<T: Clone>(input: Vec<Vec<T>>) -> Vec<Vec<T>> {
+    let mut result: Vec<Vec<T>> = vec![Vec::new()];
+    for group in input {
+        let mut next = Vec::with_capacity(result.len() * group.len().max(1));
+        for prefix in &result {
+            for elem in &group {
+                let mut combo = prefix.clone();
+                combo.push(elem.clone());
+                next.push(combo);
+            }
+        }
+        result = next;
+    }
+    result
 }
 
 fn field_conditions_match(
@@ -1503,11 +1617,11 @@ mod tests {
         let mut mapping = HashMap::new();
         mapping.insert(
             "CommandLine".to_string(),
-            "process.command_line".to_string(),
+            vec!["process.command_line".to_string()],
         );
         mapping.insert(
             "ParentImage".to_string(),
-            "process.parent.executable".to_string(),
+            vec!["process.parent.executable".to_string()],
         );
 
         let t = Transformation::FieldNameMapping { mapping };
@@ -1526,6 +1640,177 @@ mod tests {
         } else {
             panic!("Expected AllOf");
         }
+    }
+
+    #[test]
+    fn test_field_name_mapping_one_to_many_expands_to_anyof() {
+        // CommandLine maps to two alternatives; the surrounding AllOf should
+        // be restructured into AnyOf of AllOf so semantics become
+        //   (cmd_a = ... AND ParentImage = ...) OR (cmd_b = ... AND ParentImage = ...)
+        let mut rule = make_test_rule();
+        let mut state = PipelineState::default();
+        let mut mapping = HashMap::new();
+        mapping.insert(
+            "CommandLine".to_string(),
+            vec!["cmd_a".to_string(), "cmd_b".to_string()],
+        );
+
+        let t = Transformation::FieldNameMapping { mapping };
+        t.apply(&mut rule, &mut state, &[], &[], false).unwrap();
+
+        let det = &rule.detection.named["selection"];
+        let Detection::AnyOf(branches) = det else {
+            panic!("Expected AnyOf, got {det:?}");
+        };
+        assert_eq!(branches.len(), 2);
+
+        let mut seen_first_fields: Vec<Option<String>> = Vec::new();
+        for branch in branches {
+            let Detection::AllOf(items) = branch else {
+                panic!("Expected AllOf in each branch, got {branch:?}");
+            };
+            assert_eq!(items.len(), 2);
+            // Other (untouched) item is preserved across both branches.
+            assert_eq!(items[1].field.name, Some("ParentImage".to_string()));
+            seen_first_fields.push(items[0].field.name.clone());
+        }
+        seen_first_fields.sort();
+        assert_eq!(
+            seen_first_fields,
+            vec![Some("cmd_a".to_string()), Some("cmd_b".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_field_name_mapping_one_to_many_cartesian_when_two_items_expand() {
+        // Both items expand → 2 × 2 Cartesian product.
+        let mut rule = make_test_rule();
+        let mut state = PipelineState::default();
+        let mut mapping = HashMap::new();
+        mapping.insert(
+            "CommandLine".to_string(),
+            vec!["cmd_a".to_string(), "cmd_b".to_string()],
+        );
+        mapping.insert(
+            "ParentImage".to_string(),
+            vec!["parent_x".to_string(), "parent_y".to_string()],
+        );
+
+        let t = Transformation::FieldNameMapping { mapping };
+        t.apply(&mut rule, &mut state, &[], &[], false).unwrap();
+
+        let det = &rule.detection.named["selection"];
+        let Detection::AnyOf(branches) = det else {
+            panic!("Expected AnyOf, got {det:?}");
+        };
+        assert_eq!(branches.len(), 4);
+
+        let mut combos: Vec<(Option<String>, Option<String>)> = branches
+            .iter()
+            .map(|b| {
+                let Detection::AllOf(items) = b else {
+                    panic!("Expected AllOf");
+                };
+                (items[0].field.name.clone(), items[1].field.name.clone())
+            })
+            .collect();
+        combos.sort();
+        assert_eq!(
+            combos,
+            vec![
+                (Some("cmd_a".to_string()), Some("parent_x".to_string())),
+                (Some("cmd_a".to_string()), Some("parent_y".to_string())),
+                (Some("cmd_b".to_string()), Some("parent_x".to_string())),
+                (Some("cmd_b".to_string()), Some("parent_y".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_field_name_mapping_cartesian_expansion_capped() {
+        // 2 detection items × 7 alternatives each = 49 < 4096 — fine.
+        // Bump to 5 items × 7 alts = 16807 > 4096 → must be rejected.
+        // We construct that detection inline so the test is independent of
+        // make_test_rule's shape.
+        use rsigma_parser::{Detection, Detections, FieldSpec, LogSource, Modifier};
+        let alts: Vec<String> = (0..7).map(|i| format!("alt_{i}")).collect();
+        let mut mapping = HashMap::new();
+        let mut items = Vec::new();
+        for i in 0..5 {
+            let name = format!("Field{i}");
+            mapping.insert(name.clone(), alts.clone());
+            items.push(DetectionItem {
+                field: FieldSpec::new(Some(name), vec![Modifier::Contains]),
+                values: vec![SigmaValue::String(SigmaString::new("x"))],
+            });
+        }
+        let mut named = HashMap::new();
+        named.insert("selection".to_string(), Detection::AllOf(items));
+        let mut rule = SigmaRule {
+            title: "Cartesian Bomb".to_string(),
+            logsource: LogSource {
+                category: None,
+                product: None,
+                service: None,
+                definition: None,
+                custom: HashMap::new(),
+            },
+            detection: Detections {
+                named,
+                conditions: vec![ConditionExpr::Identifier("selection".to_string())],
+                condition_strings: vec!["selection".to_string()],
+                timeframe: None,
+            },
+            id: None,
+            name: None,
+            related: vec![],
+            taxonomy: None,
+            status: None,
+            description: None,
+            license: None,
+            author: None,
+            references: vec![],
+            date: None,
+            modified: None,
+            fields: vec![],
+            falsepositives: vec![],
+            level: None,
+            tags: vec![],
+            scope: vec![],
+            custom_attributes: HashMap::new(),
+        };
+
+        let mut state = PipelineState::default();
+        let t = Transformation::FieldNameMapping { mapping };
+        let err = t
+            .apply(&mut rule, &mut state, &[], &[], false)
+            .expect_err("expansion above cap must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("16807"), "expected total in error: {msg}");
+        assert!(msg.contains("4096"), "expected limit in error: {msg}");
+        assert!(
+            msg.contains("Cartesian Bomb"),
+            "expected rule title in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_field_name_mapping_single_alternative_in_list_uses_fast_path() {
+        // A single-element Vec should behave identically to a string mapping —
+        // the fast path stays in AllOf rather than promoting to AnyOf.
+        let mut rule = make_test_rule();
+        let mut state = PipelineState::default();
+        let mut mapping = HashMap::new();
+        mapping.insert("CommandLine".to_string(), vec!["cmd".to_string()]);
+
+        let t = Transformation::FieldNameMapping { mapping };
+        t.apply(&mut rule, &mut state, &[], &[], false).unwrap();
+
+        let det = &rule.detection.named["selection"];
+        let Detection::AllOf(items) = det else {
+            panic!("Expected AllOf (no expansion), got {det:?}");
+        };
+        assert_eq!(items[0].field.name, Some("cmd".to_string()));
     }
 
     #[test]
@@ -1679,8 +1964,11 @@ mod tests {
         }];
 
         let mut mapping = HashMap::new();
-        mapping.insert("CommandLine".to_string(), "process.args".to_string());
-        mapping.insert("ParentImage".to_string(), "process.parent".to_string());
+        mapping.insert("CommandLine".to_string(), vec!["process.args".to_string()]);
+        mapping.insert(
+            "ParentImage".to_string(),
+            vec!["process.parent".to_string()],
+        );
 
         let t = Transformation::FieldNameMapping { mapping };
         t.apply(&mut rule, &mut state, &[], &field_conds, false)
@@ -2549,8 +2837,8 @@ mod tests {
         }];
 
         let mut mapping = HashMap::new();
-        mapping.insert("CommandLine".to_string(), "cmd".to_string());
-        mapping.insert("ParentImage".to_string(), "parent".to_string());
+        mapping.insert("CommandLine".to_string(), vec!["cmd".to_string()]);
+        mapping.insert("ParentImage".to_string(), vec!["parent".to_string()]);
 
         let t = Transformation::FieldNameMapping { mapping };
         // field_name_cond_not = true → negate the field condition

@@ -242,7 +242,12 @@ fn apply_correlation_transformation(
 ) -> Result<bool> {
     match transformation {
         Transformation::FieldNameMapping { mapping } => {
-            remap_correlation_fields(corr, |name| mapping.get(name).cloned());
+            // Correlation fields (group_by, aliases mapping values, threshold
+            // field) are scalar — OR over multiple alternatives isn't
+            // expressible there, so we use the first listed alternative.
+            remap_correlation_fields(corr, |name| {
+                mapping.get(name).and_then(|alts| alts.first().cloned())
+            });
             Ok(true)
         }
 
@@ -470,7 +475,7 @@ fn parse_transformation(obj: &serde_yaml::Mapping) -> Result<Transformation> {
 
     match type_str {
         "field_name_mapping" => {
-            let mapping = parse_string_mapping(obj.get(ykey("mapping")))?;
+            let mapping = parse_string_or_list_mapping(obj.get(ykey("mapping")))?;
             Ok(Transformation::FieldNameMapping { mapping })
         }
 

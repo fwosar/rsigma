@@ -163,6 +163,99 @@ level: medium
 }
 
 #[test]
+fn pipeline_one_to_many_field_mapping_matches_any_alternative() {
+    // Single logical field name `Hashes` is mapped to several real fields;
+    // the rule's selector should match an event that populates any one of
+    // them (and none of the others).
+    let pipeline_yaml = r#"
+name: Hashes mapping
+transformations:
+  - type: field_name_mapping
+    mapping:
+      Hashes:
+        - file.hash.md5
+        - file.hash.sha1
+        - file.hash.sha256
+"#;
+    let pipeline = parse_pipeline(pipeline_yaml).unwrap();
+
+    let rule_yaml = r#"
+title: Known-bad hash
+logsource: {product: test}
+detection:
+    sel:
+        Hashes: 'abc123'
+    condition: sel
+"#;
+    let collection = parse_sigma_yaml(rule_yaml).unwrap();
+    let mut engine = Engine::new_with_pipeline(pipeline);
+    engine.add_collection(&collection).unwrap();
+
+    // Each alternative on its own should fire.
+    for field in ["file.hash.md5", "file.hash.sha1", "file.hash.sha256"] {
+        let ev = json!({ field: "abc123" });
+        assert_eq!(
+            engine.evaluate(&JsonEvent::borrow(&ev)).len(),
+            1,
+            "expected a hit for field {field}"
+        );
+    }
+
+    // The original logical field name must NOT match (was rewritten away).
+    let ev = json!({"Hashes": "abc123"});
+    assert!(engine.evaluate(&JsonEvent::borrow(&ev)).is_empty());
+
+    // A non-matching value on a real alternative should not fire.
+    let ev = json!({"file.hash.md5": "different"});
+    assert!(engine.evaluate(&JsonEvent::borrow(&ev)).is_empty());
+}
+
+#[test]
+fn pipeline_one_to_many_field_mapping_preserves_other_and_clauses() {
+    // A selection contains TWO items; only one is multi-mapped. The other
+    // (single-field) item must continue to AND with each expansion branch.
+    let pipeline_yaml = r#"
+name: Multi-field
+transformations:
+  - type: field_name_mapping
+    mapping:
+      Path:
+        - file.path
+        - process.executable
+"#;
+    let pipeline = parse_pipeline(pipeline_yaml).unwrap();
+
+    let rule_yaml = r#"
+title: Path + user
+logsource: {product: test}
+detection:
+    sel:
+        Path: '/tmp/evil'
+        User: 'alice'
+    condition: sel
+"#;
+    let collection = parse_sigma_yaml(rule_yaml).unwrap();
+    let mut engine = Engine::new_with_pipeline(pipeline);
+    engine.add_collection(&collection).unwrap();
+
+    // Hit via `file.path` AND matching User.
+    let ev = json!({"file.path": "/tmp/evil", "User": "alice"});
+    assert_eq!(engine.evaluate(&JsonEvent::borrow(&ev)).len(), 1);
+
+    // Hit via `process.executable` AND matching User.
+    let ev = json!({"process.executable": "/tmp/evil", "User": "alice"});
+    assert_eq!(engine.evaluate(&JsonEvent::borrow(&ev)).len(), 1);
+
+    // Path matches but User doesn't — the AND must still gate the rule.
+    let ev = json!({"file.path": "/tmp/evil", "User": "bob"});
+    assert!(engine.evaluate(&JsonEvent::borrow(&ev)).is_empty());
+
+    // User matches but no path alternative — no hit.
+    let ev = json!({"User": "alice"});
+    assert!(engine.evaluate(&JsonEvent::borrow(&ev)).is_empty());
+}
+
+#[test]
 fn matched_fields_contain_correct_values() {
     let matches = eval(
         r#"
