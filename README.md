@@ -312,7 +312,7 @@ A [Mermaid version](assets/architecture.mmd) of this diagram is also available.
 ## Reference
 
 - [pySigma](https://github.com/SigmaHQ/pySigma): reference Python implementation
-- [Sigma Specification V2.0.0](https://github.com/SigmaHQ/sigma-specification): formal specification
+- [Sigma Specification V2.1.0](https://github.com/SigmaHQ/sigma-specification): formal specification
 - [sigma-rust](https://github.com/jopohl/sigma-rust): Pratt parsing approach
 - [sigmars](https://github.com/crowdalert/sigmars): correlation support patterns
 
