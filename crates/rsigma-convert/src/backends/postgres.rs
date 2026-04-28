@@ -314,6 +314,10 @@ impl Backend for PostgresBackend {
                 "continuous_aggregate",
                 "CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)",
             ),
+            (
+                "sliding_window",
+                "Correlation queries using window functions for per-row sliding detection",
+            ),
         ]
     }
 
@@ -778,6 +782,16 @@ impl Backend for PostgresBackend {
             self.build_correlation_source(&rule.rules, &rule_queries, &table, ts, window_secs);
 
         let query = match rule.correlation_type {
+            CorrelationType::EventCount if output_format == "sliding_window" => self
+                .build_sliding_window_query(
+                    &cte_prefix,
+                    &source_table,
+                    &time_filter,
+                    &rule.group_by,
+                    ts,
+                    window_secs,
+                    &rule.condition,
+                )?,
             CorrelationType::EventCount => {
                 format!(
                     "{cte_prefix}SELECT {group_by_select}COUNT(*) AS event_count \
@@ -931,6 +945,108 @@ impl PostgresBackend {
             let union = matched.join(" UNION ALL ");
             let cte = format!("WITH combined_events AS ({union}) ");
             (cte, "combined_events".to_string(), String::new())
+        }
+    }
+
+    /// Build a sliding window query for `event_count` correlations.
+    ///
+    /// Generates a two-CTE query inspired by the pySigma Athena backend:
+    /// ```sql
+    /// WITH combined_events AS (...),
+    /// event_counts AS (
+    ///     SELECT *, COUNT(*) OVER (
+    ///         PARTITION BY {group_by}
+    ///         ORDER BY {time_field}
+    ///         RANGE BETWEEN INTERVAL '{N}' SECOND PRECEDING AND CURRENT ROW
+    ///     ) AS correlation_event_count
+    ///     FROM combined_events
+    /// )
+    /// SELECT * FROM event_counts WHERE correlation_event_count >= {threshold}
+    /// ```
+    ///
+    /// This produces a per-row sliding window that emits every event crossing
+    /// the threshold within its trailing window.
+    #[allow(clippy::too_many_arguments)]
+    fn build_sliding_window_query(
+        &self,
+        cte_prefix: &str,
+        source_table: &str,
+        time_filter: &str,
+        group_by: &[String],
+        ts: &str,
+        window_secs: u64,
+        condition: &CorrelationCondition,
+    ) -> Result<String> {
+        let partition_clause = if group_by.is_empty() {
+            String::new()
+        } else {
+            let cols: Vec<String> = group_by.iter().map(|g| self.field_expr(g)).collect();
+            format!("PARTITION BY {} ", cols.join(", "))
+        };
+
+        let where_clause = self.build_threshold_where("correlation_event_count", condition)?;
+
+        // When there is a CTE prefix (combined_events), chain the window CTE
+        // onto it. Otherwise, build a standalone source CTE from the table.
+        let full_cte = if cte_prefix.is_empty() {
+            format!(
+                "WITH source AS (\
+                 SELECT * FROM {source_table}{time_filter}\
+                 ), \
+                 event_counts AS (\
+                 SELECT *, COUNT(*) OVER (\
+                 {partition_clause}\
+                 ORDER BY {ts} \
+                 RANGE BETWEEN INTERVAL '{window_secs} seconds' PRECEDING AND CURRENT ROW\
+                 ) AS correlation_event_count \
+                 FROM source\
+                 ) "
+            )
+        } else {
+            // cte_prefix already has "WITH combined_events AS (...) "
+            // Strip the trailing space and append the window CTE
+            let base = cte_prefix.trim_end();
+            format!(
+                "{base}, \
+                 event_counts AS (\
+                 SELECT *, COUNT(*) OVER (\
+                 {partition_clause}\
+                 ORDER BY {ts} \
+                 RANGE BETWEEN INTERVAL '{window_secs} seconds' PRECEDING AND CURRENT ROW\
+                 ) AS correlation_event_count \
+                 FROM {source_table}\
+                 ) "
+            )
+        };
+
+        Ok(format!(
+            "{full_cte}SELECT * FROM event_counts WHERE {where_clause}"
+        ))
+    }
+
+    /// Build a WHERE clause from a correlation condition for sliding window queries.
+    fn build_threshold_where(&self, column: &str, cond: &CorrelationCondition) -> Result<String> {
+        match cond {
+            CorrelationCondition::Threshold { predicates, .. } => {
+                let parts: Vec<String> = predicates
+                    .iter()
+                    .map(|(op, val)| {
+                        let op_str = match op {
+                            ConditionOperator::Lt => "<",
+                            ConditionOperator::Lte => "<=",
+                            ConditionOperator::Gt => ">",
+                            ConditionOperator::Gte => ">=",
+                            ConditionOperator::Eq => "=",
+                            ConditionOperator::Neq => "<>",
+                        };
+                        format!("{column} {op_str} {val}")
+                    })
+                    .collect();
+                Ok(parts.join(" AND "))
+            }
+            CorrelationCondition::Extended(_) => Err(ConvertError::UnsupportedCorrelation(
+                "extended boolean conditions not yet supported for PostgreSQL".into(),
+            )),
         }
     }
 
@@ -2695,6 +2811,180 @@ correlation:
             q.contains("COUNT(DISTINCT"),
             "should have value_count aggregate: {q}"
         );
+    }
+
+    // --- Sliding window format ---
+
+    #[test]
+    fn test_sliding_window_event_count_with_cte() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Brute Force
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - SourceIp
+    timespan: 10m
+    condition:
+        gte: 5
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        let rule_queries = serde_json::json!({
+            "rule_a": "SELECT * FROM events WHERE EventID = 4625"
+        });
+        pipeline_state.set_state("_rule_queries".to_string(), rule_queries);
+
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "sliding_window",
+                &pipeline_state,
+            )
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("WITH combined_events AS ("),
+            "should have combined_events CTE: {q}"
+        );
+        assert!(
+            q.contains("event_counts AS ("),
+            "should have event_counts CTE: {q}"
+        );
+        assert!(
+            q.contains("COUNT(*) OVER ("),
+            "should use window function: {q}"
+        );
+        assert!(
+            q.contains("PARTITION BY"),
+            "should partition by group_by: {q}"
+        );
+        assert!(
+            q.contains("RANGE BETWEEN INTERVAL '600 seconds' PRECEDING AND CURRENT ROW"),
+            "should have sliding window frame: {q}"
+        );
+        assert!(
+            q.contains("correlation_event_count >= 5"),
+            "should filter on threshold: {q}"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_event_count_without_cte() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Brute Force No CTE
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - SourceIp
+    timespan: 5m
+    condition:
+        gte: 10
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "sliding_window",
+                &pipeline_state,
+            )
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("WITH source AS ("),
+            "should have source CTE from table: {q}"
+        );
+        assert!(
+            q.contains("FROM security_events"),
+            "source should read from default table: {q}"
+        );
+        assert!(
+            q.contains("COUNT(*) OVER ("),
+            "should use window function: {q}"
+        );
+        assert!(
+            q.contains("correlation_event_count >= 10"),
+            "should filter on threshold: {q}"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_no_group_by() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Global Count
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    timespan: 5m
+    condition:
+        gte: 50
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "sliding_window",
+                &pipeline_state,
+            )
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("PARTITION BY"),
+            "no group-by means no PARTITION BY: {q}"
+        );
+        assert!(
+            q.contains("COUNT(*) OVER ("),
+            "should still use window function: {q}"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_default_format_unchanged() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Default Format
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 100
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("OVER ("),
+            "default format should NOT use window function: {q}"
+        );
+        assert!(q.contains("GROUP BY"), "default format uses GROUP BY: {q}");
     }
 
     #[test]
