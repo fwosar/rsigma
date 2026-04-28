@@ -225,6 +225,19 @@ impl PostgresBackend {
 
     fn field_expr(&self, field: &str) -> String {
         match &self.json_field {
+            Some(json_col) if field.contains('.') => {
+                let parts: Vec<&str> = field.split('.').collect();
+                let last = parts.len() - 1;
+                let mut expr = json_col.clone();
+                for (i, part) in parts.iter().enumerate() {
+                    if i == last {
+                        expr.push_str(&format!("->>'{part}'"));
+                    } else {
+                        expr.push_str(&format!("->'{part}'"));
+                    }
+                }
+                expr
+            }
             Some(json_col) => format!("{json_col}->>'{field}'"),
             None => text_escape_and_quote_field(self.config, field),
         }
@@ -1756,6 +1769,146 @@ detection:
             vec![
                 "SELECT * FROM security_events WHERE (metadata->>'SourceIP')::inet <<= '10.0.0.0/8'::cidr"
             ]
+        );
+    }
+
+    #[test]
+    fn test_jsonb_nested_field_access() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("data".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        securityContext.isProxy: 'true'
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec![
+                "SELECT * FROM security_events WHERE data->'securityContext'->>'isProxy' = 'true'"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_jsonb_deeply_nested_field() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("data".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        a.b.c.d: val
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec!["SELECT * FROM security_events WHERE data->'a'->'b'->'c'->>'d' = 'val'"]
+        );
+    }
+
+    #[test]
+    fn test_jsonb_nested_field_exists() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("data".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        securityContext.isProxy|exists: true
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec![
+                "SELECT * FROM security_events WHERE data->'securityContext'->>'isProxy' IS NOT NULL"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_jsonb_nested_field_cidr() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("data".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        client.ipAddress|cidr: '10.0.0.0/8'
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec![
+                "SELECT * FROM security_events WHERE (data->'client'->>'ipAddress')::inet <<= '10.0.0.0/8'::cidr"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_jsonb_nested_field_regex() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("data".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        actor.displayName|re: '.*admin.*'
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec![
+                "SELECT * FROM security_events WHERE data->'actor'->>'displayName' ~* '.*admin.*'"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_jsonb_flat_field_unchanged() {
+        let mut backend = PostgresBackend::new();
+        backend.json_field = Some("data".to_string());
+        let queries = convert_with(
+            r#"
+title: Test
+logsource:
+    category: test
+detection:
+    selection:
+        eventType: user.session.start
+    condition: selection
+"#,
+            &backend,
+        );
+        assert_eq!(
+            queries,
+            vec!["SELECT * FROM security_events WHERE data->>'eventType' = 'user.session.start'"]
         );
     }
 

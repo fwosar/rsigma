@@ -274,11 +274,39 @@ SELECT * FROM event_counts WHERE correlation_event_count >= 5
 |-------|------|---------|-------------|
 | `table` | `String` | `"security_events"` | Default table name (overridden by pipeline state or `postgres.table` custom attribute) |
 | `timestamp_field` | `String` | `"time"` | Timestamp column for time-windowed queries |
-| `json_field` | `Option<String>` | `None` | If set, fields are accessed via JSONB (`col->>'field'`) |
+| `json_field` | `Option<String>` | `None` | If set, fields are accessed via JSONB extraction (see [JSONB field access](#jsonb-field-access)) |
 | `case_sensitive_re` | `bool` | `false` | Use `~` instead of `~*` for regex |
 | `schema` | `Option<String>` | `None` | PostgreSQL schema name (overridden by pipeline state or `postgres.schema` custom attribute) |
 | `database` | `Option<String>` | `None` | PostgreSQL database name (connection-level metadata) |
 | `timescaledb` | `bool` | `false` | Enable TimescaleDB-specific features |
+
+### JSONB field access
+
+When `json_field` is set (e.g. `-O json_field=data`), all Sigma field references are translated to PostgreSQL JSONB extraction operators instead of bare column names.
+
+For top-level fields, the backend uses the `->>` operator:
+
+```sql
+-- Sigma field: eventType
+data->>'eventType'
+```
+
+For dotted field names (nested paths like `securityContext.isProxy`), the backend generates chained operators where intermediate segments use `->` (returns `jsonb`) and the final segment uses `->>` (returns `text`):
+
+```sql
+-- Sigma field: securityContext.isProxy
+data->'securityContext'->>'isProxy'
+
+-- Sigma field: actor.detail.alternateId
+data->'actor'->'detail'->>'alternateId'
+```
+
+This matches the nested traversal behavior of the evaluation engine (`rsigma-eval`), which splits dotted field names on `.` and walks into nested JSON objects.
+
+```bash
+# Convert rules with JSONB field access against a "data" column
+rsigma convert -r rules/ -t postgres -O table=okta_events -O json_field=data -O timestamp_field=time
+```
 
 ## License
 

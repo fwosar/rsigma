@@ -127,6 +127,9 @@ rsigma convert -r rules/ -t postgres -p pipelines/ocsf_postgres.yml -f continuou
 # Custom backend options (table, schema, timestamp field, etc.)
 rsigma convert -r rules/ -t postgres -O table=security_logs -O schema=public -O timestamp_field=created_at
 
+# JSONB mode: access fields inside a JSONB column (supports nested paths properly)
+rsigma convert -r rules/ -t postgres -O table=okta_events -O json_field=data -O timestamp_field=time
+
 # Sliding window correlation format (per-row detection using window functions)
 rsigma convert -r rules/ -t postgres -f sliding_window
 
