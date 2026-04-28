@@ -314,6 +314,10 @@ impl Backend for PostgresBackend {
                 "continuous_aggregate",
                 "CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)",
             ),
+            (
+                "sliding_window",
+                "Correlation queries using window functions for per-row sliding detection",
+            ),
         ]
     }
 
@@ -767,12 +771,32 @@ impl Backend for PostgresBackend {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
+        // Per-rule converted queries for CTE-based pre-filtering
+        let rule_queries: HashMap<String, String> = pipeline_state
+            .state
+            .get("_rule_queries")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let (cte_prefix, source_table, time_filter) =
+            self.build_correlation_source(&rule.rules, &rule_queries, &table, ts, window_secs);
+
         let query = match rule.correlation_type {
+            CorrelationType::EventCount if output_format == "sliding_window" => self
+                .build_sliding_window_query(
+                    &cte_prefix,
+                    &source_table,
+                    &time_filter,
+                    &rule.group_by,
+                    ts,
+                    window_secs,
+                    &rule.condition,
+                )?,
             CorrelationType::EventCount => {
                 format!(
-                    "SELECT {group_by_select}COUNT(*) AS event_count \
-                     FROM {table} \
-                     WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
+                    "{cte_prefix}SELECT {group_by_select}COUNT(*) AS event_count \
+                     FROM {source_table}\
+                     {time_filter}\
                      {group_by_clause} \
                      HAVING {having_clause}",
                     having_clause = having_clause.replace("{agg}", "COUNT(*)")
@@ -784,9 +808,9 @@ impl Backend for PostgresBackend {
                     .unwrap_or_else(|| "'unknown_field'".to_string());
                 let agg = format!("COUNT(DISTINCT {field})");
                 format!(
-                    "SELECT {group_by_select}{agg} AS value_count \
-                     FROM {table} \
-                     WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
+                    "{cte_prefix}SELECT {group_by_select}{agg} AS value_count \
+                     FROM {source_table}\
+                     {time_filter}\
                      {group_by_clause} \
                      HAVING {having_clause}",
                     having_clause = having_clause.replace("{agg}", &agg)
@@ -810,9 +834,9 @@ impl Backend for PostgresBackend {
                     .unwrap_or_else(|| "'unknown_field'".to_string());
                 let agg = format!("SUM({field})");
                 format!(
-                    "SELECT {group_by_select}{agg} AS value_sum \
-                     FROM {table} \
-                     WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
+                    "{cte_prefix}SELECT {group_by_select}{agg} AS value_sum \
+                     FROM {source_table}\
+                     {time_filter}\
                      {group_by_clause} \
                      HAVING {having_clause}",
                     having_clause = having_clause.replace("{agg}", &agg)
@@ -824,9 +848,9 @@ impl Backend for PostgresBackend {
                     .unwrap_or_else(|| "'unknown_field'".to_string());
                 let agg = format!("AVG({field})");
                 format!(
-                    "SELECT {group_by_select}{agg} AS value_avg \
-                     FROM {table} \
-                     WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
+                    "{cte_prefix}SELECT {group_by_select}{agg} AS value_avg \
+                     FROM {source_table}\
+                     {time_filter}\
                      {group_by_clause} \
                      HAVING {having_clause}",
                     having_clause = having_clause.replace("{agg}", &agg)
@@ -848,10 +872,10 @@ impl Backend for PostgresBackend {
                 };
                 let agg = format!("PERCENTILE_CONT({percentile}) WITHIN GROUP (ORDER BY {field})");
                 format!(
-                    "SELECT {group_by_select}\
+                    "{cte_prefix}SELECT {group_by_select}\
                      {agg} AS pct_value \
-                     FROM {table} \
-                     WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'\
+                     FROM {source_table}\
+                     {time_filter}\
                      {group_by_clause} \
                      HAVING {having_clause}",
                     having_clause = having_clause.replace("{agg}", &agg)
@@ -888,6 +912,142 @@ impl PostgresBackend {
             return format!("{quoted_expr} AS {quoted_alias}");
         }
         self.field_expr(field)
+    }
+
+    /// Build the CTE prefix and source for non-temporal correlations.
+    ///
+    /// When per-rule converted queries are available (from `_rule_queries`
+    /// injected by `convert_collection`), wraps them in a
+    /// `WITH combined_events AS (q1 UNION ALL q2 ...)` CTE. The aggregate
+    /// query then reads from `combined_events` instead of the raw table.
+    ///
+    /// When no per-rule queries are available, falls back to the original
+    /// behavior: scan the full table with a time-window filter.
+    ///
+    /// Returns `(cte_prefix, source_table, time_filter)`.
+    fn build_correlation_source(
+        &self,
+        rule_refs: &[String],
+        rule_queries: &HashMap<String, String>,
+        default_table: &str,
+        ts: &str,
+        window_secs: u64,
+    ) -> (String, String, String) {
+        let matched: Vec<&str> = rule_refs
+            .iter()
+            .filter_map(|r| rule_queries.get(r).map(|q| q.as_str()))
+            .collect();
+
+        if matched.is_empty() {
+            let time_filter = format!(" WHERE {ts} >= NOW() - INTERVAL '{window_secs} seconds'");
+            (String::new(), default_table.to_string(), time_filter)
+        } else {
+            let union = matched.join(" UNION ALL ");
+            let cte = format!("WITH combined_events AS ({union}) ");
+            (cte, "combined_events".to_string(), String::new())
+        }
+    }
+
+    /// Build a sliding window query for `event_count` correlations.
+    ///
+    /// Generates a two-CTE query inspired by the pySigma Athena backend:
+    /// ```sql
+    /// WITH combined_events AS (...),
+    /// event_counts AS (
+    ///     SELECT *, COUNT(*) OVER (
+    ///         PARTITION BY {group_by}
+    ///         ORDER BY {time_field}
+    ///         RANGE BETWEEN INTERVAL '{N}' SECOND PRECEDING AND CURRENT ROW
+    ///     ) AS correlation_event_count
+    ///     FROM combined_events
+    /// )
+    /// SELECT * FROM event_counts WHERE correlation_event_count >= {threshold}
+    /// ```
+    ///
+    /// This produces a per-row sliding window that emits every event crossing
+    /// the threshold within its trailing window.
+    #[allow(clippy::too_many_arguments)]
+    fn build_sliding_window_query(
+        &self,
+        cte_prefix: &str,
+        source_table: &str,
+        time_filter: &str,
+        group_by: &[String],
+        ts: &str,
+        window_secs: u64,
+        condition: &CorrelationCondition,
+    ) -> Result<String> {
+        let partition_clause = if group_by.is_empty() {
+            String::new()
+        } else {
+            let cols: Vec<String> = group_by.iter().map(|g| self.field_expr(g)).collect();
+            format!("PARTITION BY {} ", cols.join(", "))
+        };
+
+        let where_clause = self.build_threshold_where("correlation_event_count", condition)?;
+
+        // When there is a CTE prefix (combined_events), chain the window CTE
+        // onto it. Otherwise, build a standalone source CTE from the table.
+        let full_cte = if cte_prefix.is_empty() {
+            format!(
+                "WITH source AS (\
+                 SELECT * FROM {source_table}{time_filter}\
+                 ), \
+                 event_counts AS (\
+                 SELECT *, COUNT(*) OVER (\
+                 {partition_clause}\
+                 ORDER BY {ts} \
+                 RANGE BETWEEN INTERVAL '{window_secs} seconds' PRECEDING AND CURRENT ROW\
+                 ) AS correlation_event_count \
+                 FROM source\
+                 ) "
+            )
+        } else {
+            // cte_prefix already has "WITH combined_events AS (...) "
+            // Strip the trailing space and append the window CTE
+            let base = cte_prefix.trim_end();
+            format!(
+                "{base}, \
+                 event_counts AS (\
+                 SELECT *, COUNT(*) OVER (\
+                 {partition_clause}\
+                 ORDER BY {ts} \
+                 RANGE BETWEEN INTERVAL '{window_secs} seconds' PRECEDING AND CURRENT ROW\
+                 ) AS correlation_event_count \
+                 FROM {source_table}\
+                 ) "
+            )
+        };
+
+        Ok(format!(
+            "{full_cte}SELECT * FROM event_counts WHERE {where_clause}"
+        ))
+    }
+
+    /// Build a WHERE clause from a correlation condition for sliding window queries.
+    fn build_threshold_where(&self, column: &str, cond: &CorrelationCondition) -> Result<String> {
+        match cond {
+            CorrelationCondition::Threshold { predicates, .. } => {
+                let parts: Vec<String> = predicates
+                    .iter()
+                    .map(|(op, val)| {
+                        let op_str = match op {
+                            ConditionOperator::Lt => "<",
+                            ConditionOperator::Lte => "<=",
+                            ConditionOperator::Gt => ">",
+                            ConditionOperator::Gte => ">=",
+                            ConditionOperator::Eq => "=",
+                            ConditionOperator::Neq => "<>",
+                        };
+                        format!("{column} {op_str} {val}")
+                    })
+                    .collect();
+                Ok(parts.join(" AND "))
+            }
+            CorrelationCondition::Extended(_) => Err(ConvertError::UnsupportedCorrelation(
+                "extended boolean conditions not yet supported for PostgreSQL".into(),
+            )),
+        }
     }
 
     /// Build HAVING clause from correlation condition predicates.
@@ -2479,6 +2639,352 @@ detection:
             queries,
             vec!["SELECT * FROM security_events WHERE action = 'login'"]
         );
+    }
+
+    // --- CTE-based pre-filtering for non-temporal correlations ---
+
+    #[test]
+    fn test_cte_prefilter_event_count() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: High Event Count
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 100
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        let rule_queries = serde_json::json!({
+            "rule_a": "SELECT * FROM security_events WHERE action = 'login'"
+        });
+        pipeline_state.set_state("_rule_queries".to_string(), rule_queries);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.starts_with("WITH combined_events AS ("),
+            "should use CTE: {q}"
+        );
+        assert!(
+            q.contains("FROM combined_events"),
+            "should read from CTE: {q}"
+        );
+        assert!(
+            q.contains("action = 'login'"),
+            "should include rule's WHERE clause: {q}"
+        );
+        assert!(
+            !q.contains("NOW()"),
+            "CTE path should not add time filter: {q}"
+        );
+    }
+
+    #[test]
+    fn test_cte_prefilter_multi_rule_union() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Multi Rule Count
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - User
+    timespan: 10m
+    condition:
+        gte: 5
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        let rule_queries = serde_json::json!({
+            "rule_a": "SELECT * FROM events WHERE EventID = 4625",
+            "rule_b": "SELECT * FROM events WHERE EventID = 4624"
+        });
+        pipeline_state.set_state("_rule_queries".to_string(), rule_queries);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("UNION ALL"),
+            "multi-rule should use UNION ALL: {q}"
+        );
+        assert!(
+            q.contains("EventID = 4625"),
+            "should include rule_a's condition: {q}"
+        );
+        assert!(
+            q.contains("EventID = 4624"),
+            "should include rule_b's condition: {q}"
+        );
+    }
+
+    #[test]
+    fn test_cte_prefilter_fallback_without_queries() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Fallback Count
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 10
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("WITH combined_events"),
+            "no CTE without _rule_queries: {q}"
+        );
+        assert!(
+            q.contains("FROM security_events"),
+            "should use default table: {q}"
+        );
+        assert!(
+            q.contains("NOW() - INTERVAL"),
+            "should have time filter: {q}"
+        );
+    }
+
+    #[test]
+    fn test_cte_prefilter_value_count() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Value Count CTE
+correlation:
+    type: value_count
+    rules:
+        - rule_a
+    group-by:
+        - SourceIp
+    timespan: 15m
+    condition:
+        field: User
+        gte: 3
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        let rule_queries = serde_json::json!({
+            "rule_a": "SELECT * FROM events WHERE action = 'auth'"
+        });
+        pipeline_state.set_state("_rule_queries".to_string(), rule_queries);
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.starts_with("WITH combined_events AS ("),
+            "value_count should use CTE: {q}"
+        );
+        assert!(
+            q.contains("COUNT(DISTINCT"),
+            "should have value_count aggregate: {q}"
+        );
+    }
+
+    // --- Sliding window format ---
+
+    #[test]
+    fn test_sliding_window_event_count_with_cte() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Brute Force
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - SourceIp
+    timespan: 10m
+    condition:
+        gte: 5
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let mut pipeline_state = PipelineState::default();
+
+        let rule_queries = serde_json::json!({
+            "rule_a": "SELECT * FROM events WHERE EventID = 4625"
+        });
+        pipeline_state.set_state("_rule_queries".to_string(), rule_queries);
+
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "sliding_window",
+                &pipeline_state,
+            )
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("WITH combined_events AS ("),
+            "should have combined_events CTE: {q}"
+        );
+        assert!(
+            q.contains("event_counts AS ("),
+            "should have event_counts CTE: {q}"
+        );
+        assert!(
+            q.contains("COUNT(*) OVER ("),
+            "should use window function: {q}"
+        );
+        assert!(
+            q.contains("PARTITION BY"),
+            "should partition by group_by: {q}"
+        );
+        assert!(
+            q.contains("RANGE BETWEEN INTERVAL '600 seconds' PRECEDING AND CURRENT ROW"),
+            "should have sliding window frame: {q}"
+        );
+        assert!(
+            q.contains("correlation_event_count >= 5"),
+            "should filter on threshold: {q}"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_event_count_without_cte() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Brute Force No CTE
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - SourceIp
+    timespan: 5m
+    condition:
+        gte: 10
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "sliding_window",
+                &pipeline_state,
+            )
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            q.contains("WITH source AS ("),
+            "should have source CTE from table: {q}"
+        );
+        assert!(
+            q.contains("FROM security_events"),
+            "source should read from default table: {q}"
+        );
+        assert!(
+            q.contains("COUNT(*) OVER ("),
+            "should use window function: {q}"
+        );
+        assert!(
+            q.contains("correlation_event_count >= 10"),
+            "should filter on threshold: {q}"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_no_group_by() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Global Count
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    timespan: 5m
+    condition:
+        gte: 50
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(
+                &collection.correlations[0],
+                "sliding_window",
+                &pipeline_state,
+            )
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("PARTITION BY"),
+            "no group-by means no PARTITION BY: {q}"
+        );
+        assert!(
+            q.contains("COUNT(*) OVER ("),
+            "should still use window function: {q}"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_default_format_unchanged() {
+        let collection = parse_sigma_yaml(
+            r#"
+title: Default Format
+correlation:
+    type: event_count
+    rules:
+        - rule_a
+    group-by:
+        - User
+    timespan: 5m
+    condition:
+        gte: 100
+"#,
+        )
+        .unwrap();
+        let backend = PostgresBackend::new();
+        let pipeline_state = PipelineState::default();
+
+        let queries = backend
+            .convert_correlation_rule(&collection.correlations[0], "default", &pipeline_state)
+            .unwrap();
+        let q = &queries[0];
+        assert!(
+            !q.contains("OVER ("),
+            "default format should NOT use window function: {q}"
+        );
+        assert!(q.contains("GROUP BY"), "default format uses GROUP BY: {q}");
     }
 
     #[test]
