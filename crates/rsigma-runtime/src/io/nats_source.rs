@@ -2,6 +2,7 @@ use async_nats::jetstream;
 use tokio_stream::StreamExt;
 
 use super::EventSource;
+use super::nats_config::NatsConnectConfig;
 
 /// Derive a NATS-safe name by combining a prefix with the subject.
 /// Replaces characters not allowed in NATS stream/consumer names (`.`, `>`, `*`)
@@ -22,7 +23,7 @@ fn derive_nats_name(prefix: &str, subject: &str) -> String {
 /// Uses at-most-once delivery: messages are acked immediately on receive,
 /// before the engine processes them. If the daemon crashes between ack and
 /// processing, the event is lost. At-least-once delivery requires a feedback
-/// channel from engine to source (deferred to Level 2).
+/// channel from engine to source.
 pub struct NatsSource {
     messages: jetstream::consumer::pull::Stream,
 }
@@ -30,10 +31,13 @@ pub struct NatsSource {
 impl NatsSource {
     /// Connect to NATS and subscribe to a JetStream stream via pull consumer.
     ///
-    /// `url` is the NATS server URL (e.g. "nats://localhost:4222").
+    /// Uses `NatsConnectConfig` for authentication and TLS settings.
     /// `subject` is the subject filter (e.g. "hel.events.>").
-    pub async fn connect(url: &str, subject: &str) -> Result<Self, async_nats::Error> {
-        let client = async_nats::connect(url).await?;
+    pub async fn connect(
+        config: &NatsConnectConfig,
+        subject: &str,
+    ) -> Result<Self, async_nats::Error> {
+        let client = config.connect().await?;
         let jetstream = jetstream::new(client);
 
         let stream_name = derive_nats_name("rsigma", subject);

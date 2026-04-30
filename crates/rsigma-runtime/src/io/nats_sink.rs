@@ -4,6 +4,8 @@ use rsigma_eval::ProcessResult;
 
 use crate::error::RuntimeError;
 
+use super::nats_config::NatsConnectConfig;
+
 /// Publishes ProcessResult as NDJSON to a NATS subject.
 pub struct NatsSink {
     client: Client,
@@ -12,8 +14,13 @@ pub struct NatsSink {
 
 impl NatsSink {
     /// Connect to NATS and prepare to publish to `subject`.
-    pub async fn connect(url: &str, subject: &str) -> Result<Self, async_nats::Error> {
-        let client = async_nats::connect(url).await?;
+    ///
+    /// Uses `NatsConnectConfig` for authentication and TLS settings.
+    pub async fn connect(
+        config: &NatsConnectConfig,
+        subject: &str,
+    ) -> Result<Self, async_nats::Error> {
+        let client = config.connect().await?;
         Ok(NatsSink {
             client,
             subject: Subject::from(subject),

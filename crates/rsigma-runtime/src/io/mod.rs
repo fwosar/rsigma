@@ -1,5 +1,7 @@
 mod file;
 #[cfg(feature = "nats")]
+pub mod nats_config;
+#[cfg(feature = "nats")]
 mod nats_sink;
 #[cfg(feature = "nats")]
 mod nats_source;
@@ -7,6 +9,8 @@ mod stdin;
 mod stdout;
 
 pub use file::FileSink;
+#[cfg(feature = "nats")]
+pub use nats_config::NatsConnectConfig;
 #[cfg(feature = "nats")]
 pub use nats_sink::NatsSink;
 #[cfg(feature = "nats")]

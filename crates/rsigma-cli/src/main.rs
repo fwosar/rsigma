@@ -24,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Parse a single Sigma YAML file and print the AST as JSON
     Parse {
@@ -210,6 +211,47 @@ enum Commands {
         /// Only used when --input-format is syslog or auto. Defaults to UTC.
         #[arg(long = "syslog-tz", default_value = "+00:00")]
         syslog_tz: String,
+
+        /// NATS credentials file (.creds) for JWT + NKey authentication.
+        /// Also reads from NATS_CREDS environment variable.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-creds", env = "NATS_CREDS")]
+        nats_creds: Option<PathBuf>,
+
+        /// NATS authentication token. Also reads from NATS_TOKEN.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-token", env = "NATS_TOKEN", conflicts_with = "nats_creds")]
+        nats_token: Option<String>,
+
+        /// NATS username (requires --nats-password). Also reads from NATS_USER.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-user", env = "NATS_USER", requires = "nats_password", conflicts_with_all = ["nats_creds", "nats_token"])]
+        nats_user: Option<String>,
+
+        /// NATS password (requires --nats-user). Also reads from NATS_PASSWORD.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-password", env = "NATS_PASSWORD", requires = "nats_user")]
+        nats_password: Option<String>,
+
+        /// NATS NKey seed for authentication. Also reads from NATS_NKEY.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-nkey", env = "NATS_NKEY", conflicts_with_all = ["nats_creds", "nats_token", "nats_user"])]
+        nats_nkey: Option<String>,
+
+        /// TLS client certificate for mutual TLS with NATS.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-tls-cert", requires = "nats_tls_key")]
+        nats_tls_cert: Option<PathBuf>,
+
+        /// TLS client private key for mutual TLS with NATS.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-tls-key", requires = "nats_tls_cert")]
+        nats_tls_key: Option<PathBuf>,
+
+        /// Require TLS for NATS connections.
+        #[cfg(feature = "daemon-nats")]
+        #[arg(long = "nats-require-tls")]
+        nats_require_tls: bool,
     },
 
     /// Evaluate events against Sigma rules
@@ -373,30 +415,61 @@ fn main() {
             drain_timeout,
             input_format,
             syslog_tz,
-        } => cmd_daemon(
-            rules,
-            pipelines,
-            jq,
-            jsonpath,
-            include_event,
-            pretty,
-            api_addr,
-            suppress,
-            action,
-            no_detections,
-            correlation_event_mode,
-            max_correlation_events,
-            timestamp_fields,
-            state_db,
-            state_save_interval,
-            input,
-            output,
-            buffer_size,
-            batch_size,
-            drain_timeout,
-            input_format,
-            syslog_tz,
-        ),
+            #[cfg(feature = "daemon-nats")]
+            nats_creds,
+            #[cfg(feature = "daemon-nats")]
+            nats_token,
+            #[cfg(feature = "daemon-nats")]
+            nats_user,
+            #[cfg(feature = "daemon-nats")]
+            nats_password,
+            #[cfg(feature = "daemon-nats")]
+            nats_nkey,
+            #[cfg(feature = "daemon-nats")]
+            nats_tls_cert,
+            #[cfg(feature = "daemon-nats")]
+            nats_tls_key,
+            #[cfg(feature = "daemon-nats")]
+            nats_require_tls,
+        } => {
+            #[cfg(feature = "daemon-nats")]
+            let nats_auth = NatsAuthArgs {
+                nats_creds,
+                nats_token,
+                nats_user,
+                nats_password,
+                nats_nkey,
+                nats_tls_cert,
+                nats_tls_key,
+                nats_require_tls,
+            };
+            cmd_daemon(
+                rules,
+                pipelines,
+                jq,
+                jsonpath,
+                include_event,
+                pretty,
+                api_addr,
+                suppress,
+                action,
+                no_detections,
+                correlation_event_mode,
+                max_correlation_events,
+                timestamp_fields,
+                state_db,
+                state_save_interval,
+                input,
+                output,
+                buffer_size,
+                batch_size,
+                drain_timeout,
+                input_format,
+                syslog_tz,
+                #[cfg(feature = "daemon-nats")]
+                nats_auth,
+            )
+        }
         Commands::Parse { path, pretty } => commands::cmd_parse(path, pretty),
         Commands::Validate {
             path,
@@ -485,6 +558,18 @@ fn main() {
 // Daemon subcommand
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "daemon-nats")]
+struct NatsAuthArgs {
+    nats_creds: Option<PathBuf>,
+    nats_token: Option<String>,
+    nats_user: Option<String>,
+    nats_password: Option<String>,
+    nats_nkey: Option<String>,
+    nats_tls_cert: Option<PathBuf>,
+    nats_tls_key: Option<PathBuf>,
+    nats_require_tls: bool,
+}
+
 #[cfg(feature = "daemon")]
 #[allow(clippy::too_many_arguments)]
 fn cmd_daemon(
@@ -510,6 +595,7 @@ fn cmd_daemon(
     drain_timeout: u64,
     input_format: String,
     syslog_tz: String,
+    #[cfg(feature = "daemon-nats")] nats_auth: NatsAuthArgs,
 ) {
     // Set up structured logging
     tracing_subscriber::fmt()
@@ -539,6 +625,19 @@ fn cmd_daemon(
         process::exit(1);
     });
 
+    #[cfg(feature = "daemon-nats")]
+    let nats_config = rsigma_runtime::NatsConnectConfig {
+        credentials_file: nats_auth.nats_creds,
+        token: nats_auth.nats_token,
+        username: nats_auth.nats_user,
+        password: nats_auth.nats_password,
+        nkey: nats_auth.nats_nkey,
+        tls_client_cert: nats_auth.nats_tls_cert,
+        tls_client_key: nats_auth.nats_tls_key,
+        require_tls: nats_auth.nats_require_tls,
+        ..Default::default()
+    };
+
     let config = daemon::server::DaemonConfig {
         rules_path,
         pipelines,
@@ -555,6 +654,8 @@ fn cmd_daemon(
         batch_size,
         drain_timeout,
         input_format: parsed_input_format,
+        #[cfg(feature = "daemon-nats")]
+        nats_config,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

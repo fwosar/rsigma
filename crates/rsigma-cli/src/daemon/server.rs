@@ -48,6 +48,8 @@ pub struct DaemonConfig {
     pub output: Vec<String>,
     pub buffer_size: usize,
     pub batch_size: usize,
+    #[cfg(feature = "daemon-nats")]
+    pub nats_config: rsigma_runtime::NatsConnectConfig,
     pub drain_timeout: u64,
     pub input_format: InputFormat,
 }
@@ -261,7 +263,9 @@ pub async fn run_daemon(config: DaemonConfig) {
         #[cfg(feature = "daemon-nats")]
         input if input.starts_with("nats://") => {
             let (url, subject) = parse_nats_url(input);
-            match rsigma_runtime::NatsSource::connect(&url, &subject).await {
+            let mut nats_cfg = config.nats_config.clone();
+            nats_cfg.url = url.clone();
+            match rsigma_runtime::NatsSource::connect(&nats_cfg, &subject).await {
                 Ok(source) => {
                     let h = spawn_source(
                         source,
@@ -350,7 +354,7 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
     let mut sinks = Vec::new();
     for spec in &output_specs {
-        sinks.push(build_sink(spec, pretty).await);
+        sinks.push(build_sink(spec, pretty, &config).await);
     }
     let sink = if sinks.len() == 1 {
         sinks.pop().unwrap()
@@ -419,7 +423,11 @@ pub async fn run_daemon(config: DaemonConfig) {
 }
 
 /// Build a single Sink from an output spec string.
-async fn build_sink(spec: &str, pretty: bool) -> Sink {
+async fn build_sink(
+    spec: &str,
+    pretty: bool,
+    #[cfg_attr(not(feature = "daemon-nats"), allow(unused))] config: &DaemonConfig,
+) -> Sink {
     if spec == "stdout" || spec == "stdout://" {
         return Sink::Stdout(StdoutSink::new(pretty));
     }
@@ -441,7 +449,9 @@ async fn build_sink(spec: &str, pretty: bool) -> Sink {
     #[cfg(feature = "daemon-nats")]
     if spec.starts_with("nats://") {
         let (url, subject) = parse_nats_url(spec);
-        return match rsigma_runtime::NatsSink::connect(&url, &subject).await {
+        let mut nats_cfg = config.nats_config.clone();
+        nats_cfg.url = url.clone();
+        return match rsigma_runtime::NatsSink::connect(&nats_cfg, &subject).await {
             Ok(nats_sink) => {
                 tracing::info!(url = url, subject = subject, "NATS sink started");
                 Sink::Nats(nats_sink)
