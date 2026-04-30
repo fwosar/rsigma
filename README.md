@@ -21,11 +21,11 @@ A complete Rust toolkit for the [Sigma](https://github.com/SigmaHQ/sigma) detect
 > [!NOTE]
 > RSigma has been featured in:
 > 
-> - [Detection Engineering Weekly #149](https://www.detectionengineering.net/p/dew-149-roll-your-own-sigma-siem) (March 2026)
+> - [Detection Engineering Weekly #149](https://www.detectionengineering.net/i/191079258/detection-engineering-gem) (March 2026)
 >   *"Building a tool like RSigma is challenging because the Sigma specification has evolved into a robust domain-specific language over the years."*
-> - [tl;dr sec #320](https://tldrsec.com/p/tldr-sec-320) (March 2026)
+> - [tl;dr sec #320](https://tldrsec.com/p/tldr-sec-320#blue-team) (March 2026)
 >   *"Accurately evaluating the full spectrum of what Sigma rules can express is quite complex, it's pretty neat to read about how RSigma handles all of these conditional expressions, correlating across rules, etc."*
-> - [Detection Engineering Weekly #154](https://www.detectionengineering.net/p/dew-154-mythos-firefox-hype-rsigma) (April 2026)
+> - [Detection Engineering Weekly #154](https://www.detectionengineering.net/i/195467950/state-of-the-art) (April 2026)
 >   *"RSigma is not a SIEM, but it's an impressive feat to build a self-contained Rust binary that operates much like one. For teams doing pre-SIEM rule validation or forensics, it's a solid plug-and-play option."*
 
 ## Installation
