@@ -16,6 +16,14 @@ use rsigma_runtime::{
 use serde::Serialize;
 use tokio::sync::mpsc;
 
+/// A dead-letter queue entry for events that fail processing.
+#[derive(Serialize)]
+struct DlqEntry {
+    original_event: String,
+    error: String,
+    timestamp: String,
+}
+
 use super::health::HealthState;
 use super::metrics::Metrics;
 use super::reload;
@@ -48,6 +56,7 @@ pub struct DaemonConfig {
     pub output: Vec<String>,
     pub buffer_size: usize,
     pub batch_size: usize,
+    pub dlq: Option<String>,
     #[cfg(feature = "daemon-nats")]
     pub nats_config: rsigma_runtime::NatsConnectConfig,
     pub drain_timeout: u64,
@@ -291,14 +300,27 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
     };
 
+    // Build optional DLQ sink from --dlq flag
+    let (dlq_tx, mut dlq_rx) = mpsc::channel::<DlqEntry>(buffer_size);
+    let dlq_sink = if let Some(ref dlq_spec) = config.dlq {
+        let sink = build_sink(dlq_spec, false, &config).await;
+        tracing::info!(dlq = dlq_spec, "Dead-letter queue enabled");
+        Some(sink)
+    } else {
+        None
+    };
+
     // Engine task: reads RawEvents, evaluates rules, sends results + ack tokens
     // to the sink channel. Events with no detections are acked immediately.
+    // Parse errors are routed to the DLQ.
     let engine_processor = processor.clone();
     let engine_metrics = metrics.clone();
     let event_filter = config.event_filter.clone();
     let batch_size = config.batch_size;
     let input_format = config.input_format.clone();
     let engine_ack_tx = ack_tx.clone();
+    let engine_dlq_tx = dlq_tx.clone();
+    let dlq_enabled = config.dlq.is_some();
     let mut engine_handle = tokio::spawn(async move {
         let filter_fn = move |v: &serde_json::Value| crate::apply_event_filter(v, &event_filter);
         loop {
@@ -323,20 +345,45 @@ pub async fn run_daemon(config: DaemonConfig) {
             }
             engine_metrics.observe_batch_size(batch.len() as u64);
 
-            let (payloads, ack_tokens): (Vec<String>, Vec<AckToken>) = batch
-                .into_iter()
-                .map(|re| (re.payload, re.ack_token))
-                .unzip();
+            // Pre-parse: route parse failures to DLQ before processing.
+            let mut valid_payloads = Vec::with_capacity(batch.len());
+            let mut valid_tokens = Vec::with_capacity(batch.len());
+
+            for raw_event in batch {
+                if dlq_enabled
+                    && !raw_event.payload.trim().is_empty()
+                    && rsigma_runtime::parse_line(&raw_event.payload, &input_format).is_none()
+                {
+                    let _ = engine_dlq_tx
+                        .send(DlqEntry {
+                            original_event: raw_event.payload,
+                            error: "parse error".to_string(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        })
+                        .await;
+                    if engine_ack_tx.send(raw_event.ack_token).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                valid_payloads.push(raw_event.payload);
+                valid_tokens.push(raw_event.ack_token);
+            }
+
+            if valid_payloads.is_empty() {
+                engine_metrics.observe_pipeline_latency(pipeline_start.elapsed().as_secs_f64());
+                continue;
+            }
 
             let results: Vec<ProcessResult> = engine_processor.process_batch_with_format(
-                &payloads,
+                &valid_payloads,
                 &input_format,
                 Some(&filter_fn),
             );
 
             let mut shutdown = false;
 
-            for (result, ack_token) in results.into_iter().zip(ack_tokens) {
+            for (result, ack_token) in results.into_iter().zip(valid_tokens) {
                 if result.detections.is_empty() && result.correlations.is_empty() {
                     if engine_ack_tx.send(ack_token).await.is_err() {
                         tracing::debug!("Ack channel closed, engine shutting down");
@@ -382,18 +429,43 @@ pub async fn run_daemon(config: DaemonConfig) {
 
     // Sink task: reads (ProcessResult, Vec<AckToken>) from channel, writes via
     // Sink dispatch, then forwards ack tokens to the ack task.
+    // On sink failure with DLQ enabled, routes the failed result to the DLQ.
     let sink_metrics = metrics.clone();
+    let sink_dlq_tx = dlq_tx;
     let sink_handle = tokio::spawn(async move {
         let mut sink = sink;
         while let Some((result, ack_tokens)) = sink_rx.recv().await {
             sink_metrics.on_output_queue_depth_change(-1);
             if let Err(e) = sink.send(&result).await {
                 tracing::warn!(error = %e, "Error writing to sink");
+                let serialized = serde_json::to_string(&result).unwrap_or_default();
+                let _ = sink_dlq_tx
+                    .send(DlqEntry {
+                        original_event: serialized,
+                        error: format!("sink delivery failure: {e}"),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    })
+                    .await;
             }
             for token in ack_tokens {
                 if ack_tx.send(token).await.is_err() {
                     tracing::debug!("Ack channel closed");
                     return;
+                }
+            }
+        }
+    });
+
+    // DLQ writer task: writes DLQ entries to the configured DLQ sink.
+    let dlq_metrics = metrics.clone();
+    let dlq_handle = tokio::spawn(async move {
+        let mut dlq_sink = dlq_sink;
+        while let Some(entry) = dlq_rx.recv().await {
+            dlq_metrics.dlq_events.inc();
+            if let Some(ref mut sink) = dlq_sink {
+                let json = serde_json::to_string(&entry).unwrap_or_default();
+                if let Err(e) = sink.send_raw(&json).await {
+                    tracing::warn!(error = %e, "Failed to write to DLQ sink");
                 }
             }
         }
@@ -431,6 +503,7 @@ pub async fn run_daemon(config: DaemonConfig) {
         let drain = async {
             let _ = engine_handle.await;
             let _ = sink_handle.await;
+            let _ = dlq_handle.await;
             let _ = ack_handle.await;
         };
         if tokio::time::timeout(drain_duration, drain).await.is_err() {
@@ -441,6 +514,7 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
     } else {
         let _ = sink_handle.await;
+        let _ = dlq_handle.await;
         let _ = ack_handle.await;
     }
 

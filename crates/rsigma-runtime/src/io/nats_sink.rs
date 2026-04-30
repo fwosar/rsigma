@@ -77,4 +77,15 @@ impl NatsSink {
 
         Ok(())
     }
+
+    /// Publish a pre-serialized JSON string directly to the JetStream subject.
+    pub async fn send_raw(&self, json: &str) -> Result<(), RuntimeError> {
+        self.jetstream
+            .publish(self.subject.clone(), json.to_string().into())
+            .await
+            .map_err(|e| RuntimeError::Io(std::io::Error::other(e)))?
+            .await
+            .map_err(|e| RuntimeError::Io(std::io::Error::other(e)))?;
+        Ok(())
+    }
 }

@@ -36,6 +36,7 @@ yamlpath = "0.34"
 yamlpatch = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 
 # daemon mode dependencies
 tokio = { version = "1", features = ["full"], optional = true }

@@ -126,6 +126,28 @@ impl Sink {
             }
         })
     }
+
+    /// Write a pre-serialized JSON string directly to this sink.
+    pub fn send_raw<'a>(
+        &'a mut self,
+        json: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self {
+                Sink::Stdout(s) => tokio::task::block_in_place(|| s.send_raw(json)),
+                Sink::File(s) => tokio::task::block_in_place(|| s.send_raw(json)),
+                #[cfg(feature = "nats")]
+                Sink::Nats(s) => s.send_raw(json).await,
+                Sink::FanOut(sinks) => {
+                    for sink in sinks {
+                        sink.send_raw(json).await?;
+                    }
+                    Ok(())
+                }
+            }
+        })
+    }
 }
 
 /// Spawn an EventSource as a tokio task wired to a shared event channel.

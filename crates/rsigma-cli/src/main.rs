@@ -200,6 +200,12 @@ enum Commands {
         #[arg(long = "drain-timeout", default_value = "5")]
         drain_timeout: u64,
 
+        /// Dead-letter queue target for events that fail processing.
+        /// Accepts same schemes as --output: stdout, file://<path>, nats://<host>:<port>/<subject>.
+        /// When not set, failed events are logged and discarded.
+        #[arg(long = "dlq")]
+        dlq: Option<String>,
+
         /// Input log format for event parsing.
         /// auto: try JSON → syslog → plain (default).
         /// Explicit: json, syslog, plain, logfmt (requires logfmt feature),
@@ -413,6 +419,7 @@ fn main() {
             buffer_size,
             batch_size,
             drain_timeout,
+            dlq,
             input_format,
             syslog_tz,
             #[cfg(feature = "daemon-nats")]
@@ -464,6 +471,7 @@ fn main() {
                 buffer_size,
                 batch_size,
                 drain_timeout,
+                dlq,
                 input_format,
                 syslog_tz,
                 #[cfg(feature = "daemon-nats")]
@@ -593,6 +601,7 @@ fn cmd_daemon(
     buffer_size: usize,
     batch_size: usize,
     drain_timeout: u64,
+    dlq: Option<String>,
     input_format: String,
     syslog_tz: String,
     #[cfg(feature = "daemon-nats")] nats_auth: NatsAuthArgs,
@@ -653,6 +662,7 @@ fn cmd_daemon(
         buffer_size,
         batch_size,
         drain_timeout,
+        dlq,
         input_format: parsed_input_format,
         #[cfg(feature = "daemon-nats")]
         nats_config,

@@ -2904,6 +2904,7 @@ dependencies = [
  "assert_cmd",
  "async-nats",
  "axum",
+ "chrono",
  "clap",
  "dirs",
  "insta",
