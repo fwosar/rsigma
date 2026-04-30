@@ -10,8 +10,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rsigma_eval::{CorrelationConfig, Pipeline, ProcessResult};
 use rsigma_runtime::{
-    FileSink, InputFormat, LogProcessor, MetricsHook, RuntimeEngine, Sink, StdinSource, StdoutSink,
-    spawn_source,
+    AckToken, FileSink, InputFormat, LogProcessor, MetricsHook, RawEvent, RuntimeEngine, Sink,
+    StdinSource, StdoutSink, spawn_source,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -30,7 +30,7 @@ struct AppState {
     reload_tx: mpsc::Sender<()>,
     start_time: Instant,
     /// Channel for HTTP event ingestion. Set when --input is http.
-    event_tx: Option<mpsc::Sender<String>>,
+    event_tx: Option<mpsc::Sender<RawEvent>>,
 }
 
 #[derive(Clone)]
@@ -141,7 +141,7 @@ pub async fn run_daemon(config: DaemonConfig) {
 
     // Create event channel early so both source and HTTP handler can use it
     let buffer_size = config.buffer_size;
-    let (event_tx, mut event_rx) = mpsc::channel::<String>(buffer_size);
+    let (event_tx, mut event_rx) = mpsc::channel::<RawEvent>(buffer_size);
 
     let http_event_tx = if config.input == "http" {
         Some(event_tx.clone())
@@ -241,8 +241,9 @@ pub async fn run_daemon(config: DaemonConfig) {
         });
     }
 
-    // --- Streaming pipeline: source -> engine -> sink ---
-    let (sink_tx, mut sink_rx) = mpsc::channel::<ProcessResult>(buffer_size);
+    // --- Streaming pipeline: source -> engine -> sink -> ack ---
+    let (sink_tx, mut sink_rx) = mpsc::channel::<(ProcessResult, Vec<AckToken>)>(buffer_size);
+    let (ack_tx, mut ack_rx) = mpsc::channel::<AckToken>(buffer_size);
 
     // Select source based on --input flag
     let source_handle: Option<tokio::task::JoinHandle<()>> = match config.input.as_str() {
@@ -290,19 +291,21 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
     };
 
-    // Engine task: reads events, evaluates rules, sends results to sink channel.
+    // Engine task: reads RawEvents, evaluates rules, sends results + ack tokens
+    // to the sink channel. Events with no detections are acked immediately.
     let engine_processor = processor.clone();
     let engine_metrics = metrics.clone();
     let event_filter = config.event_filter.clone();
     let batch_size = config.batch_size;
     let input_format = config.input_format.clone();
+    let engine_ack_tx = ack_tx.clone();
     let mut engine_handle = tokio::spawn(async move {
         let filter_fn = move |v: &serde_json::Value| crate::apply_event_filter(v, &event_filter);
         loop {
             let pipeline_start = std::time::Instant::now();
 
             let first = match event_rx.recv().await {
-                Some(line) => line,
+                Some(raw_event) => raw_event,
                 None => break,
             };
             engine_metrics.on_input_queue_depth_change(-1);
@@ -311,25 +314,39 @@ pub async fn run_daemon(config: DaemonConfig) {
             batch.push(first);
             while batch.len() < batch_size {
                 match event_rx.try_recv() {
-                    Ok(line) => {
+                    Ok(raw_event) => {
                         engine_metrics.on_input_queue_depth_change(-1);
-                        batch.push(line);
+                        batch.push(raw_event);
                     }
                     Err(_) => break,
                 }
             }
             engine_metrics.observe_batch_size(batch.len() as u64);
 
-            let results: Vec<ProcessResult> =
-                engine_processor.process_batch_with_format(&batch, &input_format, Some(&filter_fn));
+            let (payloads, ack_tokens): (Vec<String>, Vec<AckToken>) = batch
+                .into_iter()
+                .map(|re| (re.payload, re.ack_token))
+                .unzip();
+
+            let results: Vec<ProcessResult> = engine_processor.process_batch_with_format(
+                &payloads,
+                &input_format,
+                Some(&filter_fn),
+            );
 
             let mut shutdown = false;
-            for result in results {
+
+            for (result, ack_token) in results.into_iter().zip(ack_tokens) {
                 if result.detections.is_empty() && result.correlations.is_empty() {
+                    if engine_ack_tx.send(ack_token).await.is_err() {
+                        tracing::debug!("Ack channel closed, engine shutting down");
+                        shutdown = true;
+                        break;
+                    }
                     continue;
                 }
                 engine_metrics.on_output_queue_depth_change(1);
-                if sink_tx.send(result).await.is_err() {
+                if sink_tx.send((result, vec![ack_token])).await.is_err() {
                     tracing::debug!("Sink channel closed, engine shutting down");
                     shutdown = true;
                     break;
@@ -363,15 +380,29 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
     tracing::info!(output = ?output_specs, "Sink started");
 
-    // Sink task: reads ProcessResult from channel, writes via Sink dispatch
+    // Sink task: reads (ProcessResult, Vec<AckToken>) from channel, writes via
+    // Sink dispatch, then forwards ack tokens to the ack task.
     let sink_metrics = metrics.clone();
     let sink_handle = tokio::spawn(async move {
         let mut sink = sink;
-        while let Some(result) = sink_rx.recv().await {
+        while let Some((result, ack_tokens)) = sink_rx.recv().await {
             sink_metrics.on_output_queue_depth_change(-1);
             if let Err(e) = sink.send(&result).await {
                 tracing::warn!(error = %e, "Error writing to sink");
             }
+            for token in ack_tokens {
+                if ack_tx.send(token).await.is_err() {
+                    tracing::debug!("Ack channel closed");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Ack task: resolves ack tokens after the sink confirms delivery.
+    let ack_handle = tokio::spawn(async move {
+        while let Some(token) = ack_rx.recv().await {
+            token.ack().await;
         }
     });
 
@@ -400,6 +431,7 @@ pub async fn run_daemon(config: DaemonConfig) {
         let drain = async {
             let _ = engine_handle.await;
             let _ = sink_handle.await;
+            let _ = ack_handle.await;
         };
         if tokio::time::timeout(drain_duration, drain).await.is_err() {
             tracing::warn!(
@@ -409,6 +441,7 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
     } else {
         let _ = sink_handle.await;
+        let _ = ack_handle.await;
     }
 
     // Save state on shutdown
@@ -454,7 +487,7 @@ async fn build_sink(
         return match rsigma_runtime::NatsSink::connect(&nats_cfg, &subject).await {
             Ok(nats_sink) => {
                 tracing::info!(url = url, subject = subject, "NATS sink started");
-                Sink::Nats(nats_sink)
+                Sink::Nats(Box::new(nats_sink))
             }
             Err(e) => {
                 tracing::error!(error = %e, url = url, "Failed to connect NATS sink");
@@ -608,7 +641,11 @@ async fn ingest_events(State(state): State<AppState>, body: String) -> Response 
         if line.trim().is_empty() {
             continue;
         }
-        if event_tx.send(line.to_string()).await.is_err() {
+        let raw_event = RawEvent {
+            payload: line.to_string(),
+            ack_token: AckToken::Noop,
+        };
+        if event_tx.send(raw_event).await.is_err() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({

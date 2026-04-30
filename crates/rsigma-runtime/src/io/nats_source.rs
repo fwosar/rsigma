@@ -1,13 +1,13 @@
 use async_nats::jetstream;
 use tokio_stream::StreamExt;
 
-use super::EventSource;
 use super::nats_config::NatsConnectConfig;
+use super::{AckToken, EventSource, RawEvent};
 
 /// Derive a NATS-safe name by combining a prefix with the subject.
 /// Replaces characters not allowed in NATS stream/consumer names (`.`, `>`, `*`)
 /// with dashes and strips trailing dashes.
-fn derive_nats_name(prefix: &str, subject: &str) -> String {
+pub(crate) fn derive_nats_name(prefix: &str, subject: &str) -> String {
     let sanitized: String = subject
         .chars()
         .map(|c| match c {
@@ -18,12 +18,12 @@ fn derive_nats_name(prefix: &str, subject: &str) -> String {
     format!("{}-{}", prefix, sanitized.trim_end_matches('-'))
 }
 
-/// NATS JetStream consumer that yields events as JSON strings.
+/// NATS JetStream consumer that yields events.
 ///
-/// Uses at-most-once delivery: messages are acked immediately on receive,
-/// before the engine processes them. If the daemon crashes between ack and
-/// processing, the event is lost. At-least-once delivery requires a feedback
-/// channel from engine to source.
+/// Uses at-least-once delivery: messages are held until the downstream
+/// pipeline (engine + sink) confirms successful processing, then acked
+/// via the `AckToken`. If the daemon crashes before ack, NATS redelivers
+/// the message after `ack_wait` expires.
 pub struct NatsSource {
     messages: jetstream::consumer::pull::Stream,
 }
@@ -69,16 +69,16 @@ impl NatsSource {
 }
 
 impl EventSource for NatsSource {
-    async fn recv(&mut self) -> Option<String> {
+    async fn recv(&mut self) -> Option<RawEvent> {
         loop {
             match self.messages.next().await {
                 Some(Ok(msg)) => {
                     let payload = String::from_utf8_lossy(&msg.payload).to_string();
-                    if let Err(e) = msg.ack().await {
-                        tracing::warn!(error = %e, "Failed to ack NATS message");
-                    }
                     if !payload.trim().is_empty() {
-                        return Some(payload);
+                        return Some(RawEvent {
+                            payload,
+                            ack_token: AckToken::Nats(Box::new(msg)),
+                        });
                     }
                 }
                 Some(Err(e)) => {
