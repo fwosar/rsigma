@@ -10,19 +10,20 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
 
-fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+fn can_run_linux_containers() -> bool {
+    let output = std::process::Command::new("docker")
+        .args(["info", "--format", "{{.OSType}}"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "linux",
+        _ => false,
+    }
 }
 
 macro_rules! skip_without_docker {
     () => {
-        if !docker_available() {
-            eprintln!("Skipping: Docker is not available");
+        if !can_run_linux_containers() {
+            eprintln!("Skipping: Docker with Linux container support is not available");
             return;
         }
     };
