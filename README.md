@@ -18,6 +18,16 @@ A complete Rust toolkit for the [Sigma](https://github.com/SigmaHQ/sigma) detect
 > - [Streaming Logs to RSigma for Real-Time Detection](https://mostafa.dev/streaming-logs-to-rsigma-for-real-time-detection-72084b8041ad)
 > - [Building a Detection Layer on PostgreSQL with Sigma Rules](https://mostafa.dev/building-a-detection-layer-on-postgresql-with-sigma-rules-042caeb42b2a)
 
+> [!NOTE]
+> RSigma has been featured in:
+> 
+> - [Detection Engineering Weekly #149](https://www.detectionengineering.net/p/dew-149-roll-your-own-sigma-siem) (March 2026)
+>   *"Building a tool like RSigma is challenging because the Sigma specification has evolved into a robust domain-specific language over the years."*
+> - [tl;dr sec #320](https://tldrsec.com/p/tldr-sec-320) (March 2026)
+>   *"Accurately evaluating the full spectrum of what Sigma rules can express is quite complex, it's pretty neat to read about how RSigma handles all of these conditional expressions, correlating across rules, etc."*
+> - [Detection Engineering Weekly #154](https://www.detectionengineering.net/p/dew-154-mythos-firefox-hype-rsigma) (April 2026)
+>   *"RSigma is not a SIEM, but it's an impressive feat to build a self-contained Rust binary that operates much like one. For teams doing pre-SIEM rule validation or forensics, it's a solid plug-and-play option."*
+
 ## Installation
 
 ```bash
