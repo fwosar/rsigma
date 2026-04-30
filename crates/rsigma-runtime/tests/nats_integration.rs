@@ -5,6 +5,24 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
 
+fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+macro_rules! skip_without_docker {
+    () => {
+        if !docker_available() {
+            eprintln!("Skipping: Docker is not available");
+            return;
+        }
+    };
+}
+
 async fn start_nats_jetstream() -> (testcontainers::ContainerAsync<Nats>, String) {
     let cmd = NatsServerCmd::default().with_jetstream();
     let container = Nats::default()
@@ -26,6 +44,7 @@ fn config(url: &str) -> NatsConnectConfig {
 
 #[tokio::test]
 async fn source_receives_published_message() {
+    skip_without_docker!();
     let (_container, url) = start_nats_jetstream().await;
     let cfg = config(&url);
     let subject = "test.basic";
@@ -46,6 +65,7 @@ async fn source_receives_published_message() {
 
 #[tokio::test]
 async fn at_least_once_redelivery_on_missing_ack() {
+    skip_without_docker!();
     let (_container, url) = start_nats_jetstream().await;
     let cfg = config(&url);
     let subject = "test.atleastonce";
@@ -83,6 +103,7 @@ async fn at_least_once_redelivery_on_missing_ack() {
 
 #[tokio::test]
 async fn replay_from_sequence() {
+    skip_without_docker!();
     let (_container, url) = start_nats_jetstream().await;
     let cfg = config(&url);
     let subject = "test.replay.seq";
@@ -114,6 +135,7 @@ async fn replay_from_sequence() {
 
 #[tokio::test]
 async fn replay_latest() {
+    skip_without_docker!();
     let (_container, url) = start_nats_jetstream().await;
     let cfg = config(&url);
     let subject = "test.replay.latest";
@@ -144,6 +166,7 @@ async fn replay_latest() {
 
 #[tokio::test]
 async fn consumer_group_shared_workload() {
+    skip_without_docker!();
     let (_container, url) = start_nats_jetstream().await;
     let cfg = config(&url);
     let subject = "test.cgroup";
@@ -184,6 +207,7 @@ async fn consumer_group_shared_workload() {
 
 #[tokio::test]
 async fn auth_user_password() {
+    skip_without_docker!();
     let cmd = NatsServerCmd::default()
         .with_user("testuser")
         .with_password("testpass")
@@ -232,6 +256,7 @@ async fn auth_user_password() {
 
 #[tokio::test]
 async fn dlq_write_and_read() {
+    skip_without_docker!();
     let (_container, url) = start_nats_jetstream().await;
     let cfg = config(&url);
     let dlq_subject = "test.dlq";
