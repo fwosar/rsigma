@@ -274,10 +274,24 @@ enum Commands {
         #[arg(long = "replay-from-latest", conflicts_with_all = ["replay_from_sequence", "replay_from_time"])]
         replay_from_latest: bool,
 
-        /// Clear correlation state when replaying (auto-enabled with --replay-from-*).
-        #[cfg(feature = "daemon-nats")]
-        #[arg(long = "clear-state")]
+        /// Clear correlation state on startup. When used with --replay-from-*,
+        /// forces a clean slate even if the replay starts after the stored position.
+        #[arg(long = "clear-state", conflicts_with = "keep_state")]
         clear_state: bool,
+
+        /// Force restore correlation state even during replay. Use when you know
+        /// the replay starts after the last processed position (forward catch-up)
+        /// and want to preserve cross-boundary correlation windows.
+        #[arg(long = "keep-state", conflicts_with = "clear_state")]
+        keep_state: bool,
+
+        /// Behavior when no timestamp field is found in an event.
+        /// 'wallclock' (default): use wall-clock time for correlation windows.
+        /// 'skip': run detections but skip correlation state updates for that
+        /// event. Recommended for forensic replay of logs without timestamps.
+        #[arg(long = "timestamp-fallback", default_value = "wallclock",
+               value_parser = ["wallclock", "skip"])]
+        timestamp_fallback: String,
 
         /// Consumer group name for NATS JetStream load balancing.
         /// Multiple daemon instances using the same group name share the
@@ -471,8 +485,9 @@ fn main() {
             replay_from_time,
             #[cfg(feature = "daemon-nats")]
             replay_from_latest,
-            #[cfg(feature = "daemon-nats")]
             clear_state,
+            keep_state,
+            timestamp_fallback,
             #[cfg(feature = "daemon-nats")]
             consumer_group,
         } => {
@@ -504,9 +519,13 @@ fn main() {
                 rsigma_runtime::ReplayPolicy::Resume
             };
 
-            #[cfg(feature = "daemon-nats")]
-            let clear_correlation_state =
-                clear_state || !matches!(replay_policy, rsigma_runtime::ReplayPolicy::Resume);
+            let state_restore_mode = if clear_state {
+                daemon::server::StateRestoreMode::ForceClear
+            } else if keep_state {
+                daemon::server::StateRestoreMode::ForceKeep
+            } else {
+                daemon::server::StateRestoreMode::Auto
+            };
 
             cmd_daemon(
                 rules,
@@ -522,6 +541,7 @@ fn main() {
                 correlation_event_mode,
                 max_correlation_events,
                 timestamp_fields,
+                timestamp_fallback,
                 state_db,
                 state_save_interval,
                 input,
@@ -532,12 +552,11 @@ fn main() {
                 dlq,
                 input_format,
                 syslog_tz,
+                state_restore_mode,
                 #[cfg(feature = "daemon-nats")]
                 nats_auth,
                 #[cfg(feature = "daemon-nats")]
                 replay_policy,
-                #[cfg(feature = "daemon-nats")]
-                clear_correlation_state,
                 #[cfg(feature = "daemon-nats")]
                 consumer_group,
             )
@@ -658,6 +677,7 @@ fn cmd_daemon(
     correlation_event_mode: String,
     max_correlation_events: usize,
     timestamp_fields: Vec<String>,
+    timestamp_fallback: String,
     state_db: Option<PathBuf>,
     state_save_interval: u64,
     input: String,
@@ -668,9 +688,9 @@ fn cmd_daemon(
     dlq: Option<String>,
     input_format: String,
     syslog_tz: String,
+    state_restore_mode: daemon::server::StateRestoreMode,
     #[cfg(feature = "daemon-nats")] nats_auth: NatsAuthArgs,
     #[cfg(feature = "daemon-nats")] replay_policy: rsigma_runtime::ReplayPolicy,
-    #[cfg(feature = "daemon-nats")] clear_correlation_state: bool,
     #[cfg(feature = "daemon-nats")] consumer_group: Option<String>,
 ) {
     // Set up structured logging
@@ -694,6 +714,7 @@ fn cmd_daemon(
         correlation_event_mode,
         max_correlation_events,
         timestamp_fields,
+        &timestamp_fallback,
     );
 
     let addr: std::net::SocketAddr = api_addr.parse().unwrap_or_else(|e| {
@@ -736,9 +757,8 @@ fn cmd_daemon(
         #[cfg(feature = "daemon-nats")]
         replay_policy,
         #[cfg(feature = "daemon-nats")]
-        clear_correlation_state,
-        #[cfg(feature = "daemon-nats")]
         consumer_group,
+        state_restore_mode,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -954,6 +974,7 @@ pub(crate) fn build_correlation_config(
     correlation_event_mode: String,
     max_correlation_events: usize,
     extra_timestamp_fields: Vec<String>,
+    timestamp_fallback: &str,
 ) -> CorrelationConfig {
     let suppress_secs = suppress.map(|s| match rsigma_parser::Timespan::parse(&s) {
         Ok(ts) => ts.seconds,
@@ -979,12 +1000,18 @@ pub(crate) fn build_correlation_config(
             process::exit(1);
         });
 
+    let ts_fallback = match timestamp_fallback {
+        "skip" => rsigma_eval::TimestampFallback::Skip,
+        _ => rsigma_eval::TimestampFallback::WallClock,
+    };
+
     let mut config = CorrelationConfig {
         suppress: suppress_secs,
         action_on_match,
         emit_detections: !no_detections,
         correlation_event_mode: event_mode,
         max_correlation_events,
+        timestamp_fallback: ts_fallback,
         ..Default::default()
     };
 

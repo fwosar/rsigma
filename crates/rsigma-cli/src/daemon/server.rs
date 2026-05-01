@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::extract::State;
@@ -27,8 +28,21 @@ struct DlqEntry {
 use super::health::HealthState;
 use super::metrics::Metrics;
 use super::reload;
-use super::store::SqliteStateStore;
+use super::store::{SourcePosition, SqliteStateStore};
 use crate::EventFilter;
+
+/// Controls whether correlation state is restored from SQLite on startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateRestoreMode {
+    /// Decide automatically. For NATS replay, compare the replay start point
+    /// against the stored source position: restore when replaying forward,
+    /// skip when replaying backward. For non-NATS and Resume, always restore.
+    Auto,
+    /// Unconditionally clear state (`--clear-state`).
+    ForceClear,
+    /// Unconditionally restore state (`--keep-state`).
+    ForceKeep,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -62,9 +76,8 @@ pub struct DaemonConfig {
     #[cfg(feature = "daemon-nats")]
     pub replay_policy: rsigma_runtime::ReplayPolicy,
     #[cfg(feature = "daemon-nats")]
-    pub clear_correlation_state: bool,
-    #[cfg(feature = "daemon-nats")]
     pub consumer_group: Option<String>,
+    pub state_restore_mode: StateRestoreMode,
     pub drain_timeout: u64,
     pub input_format: InputFormat,
 }
@@ -115,28 +128,38 @@ pub async fn run_daemon(config: DaemonConfig) {
     }
 
     // Restore correlation state from SQLite (after rules are loaded).
-    // When replaying (--replay-from-*), skip restoration to avoid double-counting.
-    #[allow(unused_mut)]
-    let mut skip_state_restore = false;
-    #[cfg(feature = "daemon-nats")]
-    if config.clear_correlation_state {
-        skip_state_restore = true;
-        tracing::info!("Correlation state cleared for replay mode");
-    }
-    if !skip_state_restore && let Some(ref store) = state_store {
+    //
+    // The decision depends on `state_restore_mode`:
+    // - ForceClear: always skip (--clear-state).
+    // - ForceKeep: always restore (--keep-state).
+    // - Auto: for NATS replay, compare the replay start point against the
+    //   stored source position to avoid double-counting when replaying
+    //   backward, while preserving cross-boundary correlations when
+    //   replaying forward. For non-NATS and Resume, always restore.
+    if let Some(ref store) = state_store {
         match store.load().await {
-            Ok(Some(snapshot)) => {
-                if processor.import_state(&snapshot) {
-                    let entries = snapshot.windows.values().map(|g| g.len()).sum::<usize>();
-                    tracing::info!(
-                        state_entries = entries,
-                        "Correlation state restored from database"
-                    );
+            Ok(Some((snapshot, stored_position))) => {
+                let should_restore = decide_state_restore(
+                    config.state_restore_mode,
+                    stored_position,
+                    #[cfg(feature = "daemon-nats")]
+                    &config.replay_policy,
+                );
+                if should_restore {
+                    if processor.import_state(&snapshot) {
+                        let entries = snapshot.windows.values().map(|g| g.len()).sum::<usize>();
+                        tracing::info!(
+                            state_entries = entries,
+                            "Correlation state restored from database"
+                        );
+                    } else {
+                        tracing::warn!(
+                            snapshot_version = snapshot.version,
+                            "Incompatible snapshot version, starting with fresh state"
+                        );
+                    }
                 } else {
-                    tracing::warn!(
-                        snapshot_version = snapshot.version,
-                        "Incompatible snapshot version, starting with fresh state"
-                    );
+                    tracing::info!("Correlation state cleared (not restoring)");
                 }
             }
             Ok(None) => {
@@ -243,11 +266,18 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
     });
 
+    // High-water mark for the last acked NATS stream position.
+    // Updated by the ack task, read by the periodic/shutdown state saver.
+    let high_water_seq = Arc::new(AtomicU64::new(0));
+    let high_water_ts = Arc::new(AtomicI64::new(0));
+
     // Spawn periodic state saver
     if let Some(ref store) = state_store {
         let save_processor = processor.clone();
         let save_store = store.clone();
         let save_interval_secs = config.state_save_interval;
+        let save_hw_seq = high_water_seq.clone();
+        let save_hw_ts = high_water_ts.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(save_interval_secs));
@@ -255,7 +285,8 @@ pub async fn run_daemon(config: DaemonConfig) {
             loop {
                 interval.tick().await;
                 if let Some(snapshot) = save_processor.export_state() {
-                    if let Err(e) = save_store.save(&snapshot).await {
+                    let position = source_position_from_atomics(&save_hw_seq, &save_hw_ts);
+                    if let Err(e) = save_store.save(&snapshot, position.as_ref()).await {
                         tracing::warn!(error = %e, "Failed to save periodic state snapshot");
                     } else {
                         tracing::debug!("Periodic state snapshot saved");
@@ -494,8 +525,17 @@ pub async fn run_daemon(config: DaemonConfig) {
     });
 
     // Ack task: resolves ack tokens after the sink confirms delivery.
+    // For NATS tokens, extracts the stream sequence before acking to maintain
+    // the high-water mark used by the state saver.
+    #[cfg(feature = "daemon-nats")]
+    let (ack_hw_seq, ack_hw_ts) = (high_water_seq.clone(), high_water_ts.clone());
     let ack_handle = tokio::spawn(async move {
         while let Some(token) = ack_rx.recv().await {
+            #[cfg(feature = "daemon-nats")]
+            if let Some((seq, ts)) = token.nats_stream_position() {
+                ack_hw_seq.fetch_max(seq, Ordering::Relaxed);
+                ack_hw_ts.fetch_max(ts, Ordering::Relaxed);
+            }
             token.ack().await;
         }
     });
@@ -544,8 +584,18 @@ pub async fn run_daemon(config: DaemonConfig) {
     if let Some(ref store) = state_store
         && let Some(snapshot) = processor.export_state()
     {
-        match store.save(&snapshot).await {
-            Ok(()) => tracing::info!("Correlation state saved to database on shutdown"),
+        let position = source_position_from_atomics(&high_water_seq, &high_water_ts);
+        match store.save(&snapshot, position.as_ref()).await {
+            Ok(()) => {
+                if let Some(ref pos) = position {
+                    tracing::info!(
+                        source_sequence = pos.sequence,
+                        "Correlation state saved to database on shutdown"
+                    );
+                } else {
+                    tracing::info!("Correlation state saved to database on shutdown");
+                }
+            }
             Err(e) => tracing::error!(error = %e, "Failed to save state on shutdown"),
         }
     }
@@ -621,6 +671,110 @@ fn parse_nats_url(url: &str) -> (String, String) {
         }
         None => (format!("nats://{without_scheme}"), ">".to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// State restore decision
+// ---------------------------------------------------------------------------
+
+/// Decide whether to restore correlation state from SQLite.
+fn decide_state_restore(
+    mode: StateRestoreMode,
+    stored_position: Option<SourcePosition>,
+    #[cfg(feature = "daemon-nats")] replay_policy: &rsigma_runtime::ReplayPolicy,
+) -> bool {
+    match mode {
+        StateRestoreMode::ForceClear => {
+            tracing::info!("State restore skipped (--clear-state)");
+            false
+        }
+        StateRestoreMode::ForceKeep => {
+            tracing::info!("State restore forced (--keep-state)");
+            true
+        }
+        StateRestoreMode::Auto => {
+            #[cfg(feature = "daemon-nats")]
+            {
+                use rsigma_runtime::ReplayPolicy;
+                match replay_policy {
+                    ReplayPolicy::Resume => true,
+                    ReplayPolicy::Latest => {
+                        tracing::info!("State restore skipped (--replay-from-latest starts fresh)");
+                        false
+                    }
+                    ReplayPolicy::FromSequence(replay_seq) => match stored_position {
+                        Some(pos) if *replay_seq > pos.sequence => {
+                            tracing::info!(
+                                replay_from = replay_seq,
+                                stored_sequence = pos.sequence,
+                                "Restoring state (replay starts after stored position)"
+                            );
+                            true
+                        }
+                        Some(pos) => {
+                            tracing::info!(
+                                replay_from = replay_seq,
+                                stored_sequence = pos.sequence,
+                                "State restore skipped (replay starts at or before stored position, would double-count)"
+                            );
+                            false
+                        }
+                        None => {
+                            tracing::info!(
+                                "State restore skipped (no stored position to compare against replay)"
+                            );
+                            false
+                        }
+                    },
+                    ReplayPolicy::FromTime(replay_time) => {
+                        let replay_ts = replay_time.unix_timestamp();
+                        match stored_position {
+                            Some(pos) if replay_ts > pos.timestamp => {
+                                tracing::info!(
+                                    replay_from_ts = replay_ts,
+                                    stored_ts = pos.timestamp,
+                                    "Restoring state (replay starts after stored timestamp)"
+                                );
+                                true
+                            }
+                            Some(pos) => {
+                                tracing::info!(
+                                    replay_from_ts = replay_ts,
+                                    stored_ts = pos.timestamp,
+                                    "State restore skipped (replay starts at or before stored timestamp, would double-count)"
+                                );
+                                false
+                            }
+                            None => {
+                                tracing::info!(
+                                    "State restore skipped (no stored position to compare against replay)"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "daemon-nats"))]
+            {
+                let _ = stored_position;
+                true
+            }
+        }
+    }
+}
+
+/// Build a `SourcePosition` from the high-water mark atomics.
+/// Returns `None` if no NATS messages have been acked yet (sequence == 0).
+fn source_position_from_atomics(seq: &AtomicU64, ts: &AtomicI64) -> Option<SourcePosition> {
+    let s = seq.load(Ordering::Relaxed);
+    if s == 0 {
+        return None;
+    }
+    Some(SourcePosition {
+        sequence: s,
+        timestamp: ts.load(Ordering::Relaxed),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -759,4 +913,138 @@ async fn ingest_events(State(state): State<AppState>, body: String) -> Response 
         Json(serde_json::json!({ "accepted": accepted })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_clear_always_skips() {
+        let result = decide_state_restore(
+            StateRestoreMode::ForceClear,
+            Some(SourcePosition {
+                sequence: 100,
+                timestamp: 1000,
+            }),
+            #[cfg(feature = "daemon-nats")]
+            &rsigma_runtime::ReplayPolicy::Resume,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn force_keep_always_restores() {
+        let result = decide_state_restore(
+            StateRestoreMode::ForceKeep,
+            None,
+            #[cfg(feature = "daemon-nats")]
+            &rsigma_runtime::ReplayPolicy::Latest,
+        );
+        assert!(result);
+    }
+
+    #[cfg(feature = "daemon-nats")]
+    mod nats_auto {
+        use super::*;
+        use rsigma_runtime::ReplayPolicy;
+
+        #[test]
+        fn resume_restores() {
+            assert!(decide_state_restore(
+                StateRestoreMode::Auto,
+                None,
+                &ReplayPolicy::Resume,
+            ));
+        }
+
+        #[test]
+        fn latest_skips() {
+            assert!(!decide_state_restore(
+                StateRestoreMode::Auto,
+                Some(SourcePosition {
+                    sequence: 100,
+                    timestamp: 1000,
+                }),
+                &ReplayPolicy::Latest,
+            ));
+        }
+
+        #[test]
+        fn forward_sequence_restores() {
+            assert!(decide_state_restore(
+                StateRestoreMode::Auto,
+                Some(SourcePosition {
+                    sequence: 100,
+                    timestamp: 1000,
+                }),
+                &ReplayPolicy::FromSequence(101),
+            ));
+        }
+
+        #[test]
+        fn backward_sequence_skips() {
+            assert!(!decide_state_restore(
+                StateRestoreMode::Auto,
+                Some(SourcePosition {
+                    sequence: 100,
+                    timestamp: 1000,
+                }),
+                &ReplayPolicy::FromSequence(50),
+            ));
+        }
+
+        #[test]
+        fn equal_sequence_skips() {
+            assert!(!decide_state_restore(
+                StateRestoreMode::Auto,
+                Some(SourcePosition {
+                    sequence: 100,
+                    timestamp: 1000,
+                }),
+                &ReplayPolicy::FromSequence(100),
+            ));
+        }
+
+        #[test]
+        fn forward_time_restores() {
+            let future = time::OffsetDateTime::from_unix_timestamp(2000).unwrap();
+            assert!(decide_state_restore(
+                StateRestoreMode::Auto,
+                Some(SourcePosition {
+                    sequence: 100,
+                    timestamp: 1000,
+                }),
+                &ReplayPolicy::FromTime(future),
+            ));
+        }
+
+        #[test]
+        fn backward_time_skips() {
+            let past = time::OffsetDateTime::from_unix_timestamp(500).unwrap();
+            assert!(!decide_state_restore(
+                StateRestoreMode::Auto,
+                Some(SourcePosition {
+                    sequence: 100,
+                    timestamp: 1000,
+                }),
+                &ReplayPolicy::FromTime(past),
+            ));
+        }
+
+        #[test]
+        fn no_stored_position_skips_on_replay() {
+            assert!(!decide_state_restore(
+                StateRestoreMode::Auto,
+                None,
+                &ReplayPolicy::FromSequence(42),
+            ));
+        }
+    }
+
+    #[cfg(not(feature = "daemon-nats"))]
+    #[test]
+    fn auto_without_nats_restores() {
+        assert!(decide_state_restore(StateRestoreMode::Auto, None));
+    }
 }
