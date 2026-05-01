@@ -3,6 +3,7 @@
 mod common;
 
 use common::{SIMPLE_RULE, rsigma, temp_file};
+use rusqlite::params;
 use tempfile::TempDir;
 
 const DAEMON_CORRELATION_RULES: &str = r#"
@@ -547,4 +548,325 @@ level: high
 
     assert!(output.status.success());
     insta::assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r#"{"rule_title":"Error Detected","rule_id":"00000000-0000-0000-0000-000000000097","level":"high","tags":[],"matched_selections":["keywords"],"matched_fields":[]}"#);
+}
+
+// ---------------------------------------------------------------------------
+// State restore mode tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "daemon")]
+#[test]
+fn daemon_clear_state_prevents_restore() {
+    let rules = temp_file(".yml", DAEMON_CORRELATION_RULES);
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+
+    // Run 1: send 2 events to build state (below threshold)
+    let events_run1 = "{\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                        {\"EventType\":\"login\",\"User\":\"admin\"}\n";
+    rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+        ])
+        .write_stdin(events_run1)
+        .assert()
+        .success();
+
+    // Run 2: send 1 event with --clear-state. State is wiped, so total is 1, not 3.
+    let output = rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+            "--clear-state",
+        ])
+        .write_stdin("{\"EventType\":\"login\",\"User\":\"admin\"}\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "--clear-state should prevent restore, so correlation should not fire: {stdout}"
+    );
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn daemon_keep_state_forces_restore() {
+    let rules = temp_file(".yml", DAEMON_CORRELATION_RULES);
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+
+    // Run 1: send 2 events (below threshold)
+    let events_run1 = "{\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                        {\"EventType\":\"login\",\"User\":\"admin\"}\n";
+    rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+        ])
+        .write_stdin(events_run1)
+        .assert()
+        .success();
+
+    // Run 2: send 1 event with --keep-state. Restored 2 + 1 = 3, should fire.
+    let output = rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+            "--keep-state",
+        ])
+        .write_stdin("{\"EventType\":\"login\",\"User\":\"admin\"}\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"rule_title\":\"Many Logins\""),
+        "--keep-state should restore correlation state: {stdout}"
+    );
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn daemon_clear_state_and_keep_state_conflict() {
+    let rules = temp_file(".yml", DAEMON_CORRELATION_RULES);
+
+    rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--clear-state",
+            "--keep-state",
+        ])
+        .write_stdin("")
+        .assert()
+        .failure();
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn daemon_timestamp_fallback_skip() {
+    let rules = temp_file(".yml", DAEMON_CORRELATION_RULES);
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+
+    // Send 4 events WITHOUT timestamps with --timestamp-fallback skip.
+    // Detection fires (stateless), but correlation should not count them
+    // because events without parseable timestamps are skipped.
+    let events = "{\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                   {\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                   {\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                   {\"EventType\":\"login\",\"User\":\"admin\"}\n";
+    let output = rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+            "--timestamp-fallback",
+            "skip",
+        ])
+        .write_stdin(events)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Many Logins"),
+        "--timestamp-fallback skip should prevent correlation from firing: {stdout}"
+    );
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn daemon_timestamp_fallback_wallclock_default() {
+    let rules = temp_file(".yml", DAEMON_CORRELATION_RULES);
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+
+    // Same events without timestamps, but default (wallclock) fallback.
+    // Correlation should fire because wallclock substitutes current time.
+    let events = "{\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                   {\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                   {\"EventType\":\"login\",\"User\":\"admin\"}\n";
+    let output = rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+        ])
+        .write_stdin(events)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"rule_title\":\"Many Logins\""),
+        "default wallclock fallback should allow correlation to fire: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Schema migration test
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "daemon")]
+#[test]
+fn daemon_state_db_migration_from_old_schema() {
+    let rules = temp_file(".yml", DAEMON_CORRELATION_RULES);
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+
+    // Step 1: Create a state DB with the OLD schema (no source_sequence/source_timestamp)
+    // by running the daemon once to get a valid snapshot, then stripping the new columns.
+    let events = "{\"EventType\":\"login\",\"User\":\"admin\"}\n\
+                   {\"EventType\":\"login\",\"User\":\"admin\"}\n";
+    rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+        ])
+        .write_stdin(events)
+        .assert()
+        .success();
+
+    // Extract the snapshot, then recreate the DB with old schema
+    let snapshot: String = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT snapshot FROM rsigma_correlation_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    // Recreate with old schema (no source_sequence/source_timestamp columns)
+    std::fs::remove_file(&db_path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE rsigma_correlation_state (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 snapshot TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rsigma_correlation_state (id, snapshot, updated_at) VALUES (1, ?1, ?2)",
+            params![&snapshot, 1000i64],
+        )
+        .unwrap();
+    }
+
+    // Verify old schema has no source columns
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(rsigma_correlation_state)")
+            .unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            !columns.contains(&"source_sequence".to_string()),
+            "old schema should not have source_sequence"
+        );
+    }
+
+    // Step 2: Run daemon with --keep-state on the old DB.
+    // It should auto-migrate and restore the snapshot.
+    let output = rsigma()
+        .args([
+            "daemon",
+            "-r",
+            rules.path().to_str().unwrap(),
+            "--state-db",
+            db_path.to_str().unwrap(),
+            "--api-addr",
+            "127.0.0.1:0",
+            "--no-detections",
+            "--keep-state",
+        ])
+        .write_stdin("{\"EventType\":\"login\",\"User\":\"admin\"}\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"rule_title\":\"Many Logins\""),
+        "migrated DB should restore state (2 from old + 1 new = 3): {stdout}"
+    );
+
+    // Step 3: Verify schema was migrated (new columns exist)
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(rsigma_correlation_state)")
+        .unwrap();
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        columns.contains(&"source_sequence".to_string()),
+        "schema should be migrated to include source_sequence"
+    );
+    assert!(
+        columns.contains(&"source_timestamp".to_string()),
+        "schema should be migrated to include source_timestamp"
+    );
 }

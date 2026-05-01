@@ -59,3 +59,5 @@ bytes = "1"
 futures = "0.3"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["nats"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde_json = "1"
