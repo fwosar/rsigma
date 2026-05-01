@@ -51,6 +51,21 @@ impl AckToken {
             }
         }
     }
+
+    /// Extract the NATS JetStream stream sequence and published timestamp.
+    ///
+    /// Returns `None` for non-NATS tokens or if message info parsing fails.
+    /// The tuple is `(stream_sequence, published_unix_timestamp_secs)`.
+    #[cfg(feature = "nats")]
+    pub fn nats_stream_position(&self) -> Option<(u64, i64)> {
+        match self {
+            AckToken::Noop => None,
+            AckToken::Nats(msg) => msg
+                .info()
+                .ok()
+                .map(|info| (info.stream_sequence, info.published.unix_timestamp())),
+        }
+    }
 }
 
 /// An event payload bundled with its acknowledgment token.

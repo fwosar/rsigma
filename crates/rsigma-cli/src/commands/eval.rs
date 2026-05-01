@@ -68,6 +68,7 @@ pub(crate) fn cmd_eval(
         correlation_event_mode,
         max_correlation_events,
         timestamp_fields,
+        "wallclock",
     );
 
     if has_correlations {

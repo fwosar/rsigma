@@ -3,6 +3,20 @@ use std::sync::{Arc, Mutex};
 
 use rsigma_eval::CorrelationSnapshot;
 
+/// Position of the last acked event from the source stream.
+///
+/// Stored alongside the correlation snapshot so the daemon can make an
+/// informed decision about whether to restore state during replay:
+/// restoring is safe when the replay starts *after* the stored position,
+/// but would cause double-counting when replaying backwards.
+#[derive(Debug, Clone, Copy)]
+pub struct SourcePosition {
+    /// JetStream stream sequence of the last acked message.
+    pub sequence: u64,
+    /// Unix timestamp (seconds) of the last acked message's `published` time.
+    pub timestamp: i64,
+}
+
 /// SQLite-backed state store for persisting correlation state across restarts.
 ///
 /// Follows the same pattern as helr's `SqliteStateStore`: a single
@@ -30,14 +44,49 @@ impl SqliteStateStore {
         )
         .map_err(|e| format!("init sqlite schema: {e}"))?;
 
+        Self::migrate(&conn)?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    /// Save a correlation snapshot to the database.
+    /// Add columns introduced after the initial schema.
+    fn migrate(conn: &rusqlite::Connection) -> Result<(), String> {
+        let has_column = |col: &str| -> Result<bool, String> {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(rsigma_correlation_state)")
+                .map_err(|e| format!("pragma table_info: {e}"))?;
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| format!("query pragma: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(names.iter().any(|n| n == col))
+        };
+
+        if !has_column("source_sequence")? {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE rsigma_correlation_state
+                    ADD COLUMN source_sequence INTEGER;
+                ALTER TABLE rsigma_correlation_state
+                    ADD COLUMN source_timestamp INTEGER;
+                "#,
+            )
+            .map_err(|e| format!("migrate source position columns: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Save a correlation snapshot (and optional source position) to the database.
     /// Replaces any existing snapshot (single-row table).
-    pub async fn save(&self, snapshot: &CorrelationSnapshot) -> Result<(), String> {
+    pub async fn save(
+        &self,
+        snapshot: &CorrelationSnapshot,
+        position: Option<&SourcePosition>,
+    ) -> Result<(), String> {
         let json =
             serde_json::to_string(snapshot).map_err(|e| format!("serialize snapshot: {e}"))?;
         let conn = self.conn.clone();
@@ -45,13 +94,19 @@ impl SqliteStateStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
+        let seq = position.map(|p| p.sequence as i64);
+        let ts = position.map(|p| p.timestamp);
 
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().map_err(|_| "state store lock poisoned")?;
             c.execute(
-                "INSERT INTO rsigma_correlation_state (id, snapshot, updated_at) VALUES (1, ?1, ?2)
-                 ON CONFLICT (id) DO UPDATE SET snapshot = ?1, updated_at = ?2",
-                rusqlite::params![&json, updated_at],
+                "INSERT INTO rsigma_correlation_state
+                    (id, snapshot, updated_at, source_sequence, source_timestamp)
+                 VALUES (1, ?1, ?2, ?3, ?4)
+                 ON CONFLICT (id) DO UPDATE SET
+                    snapshot = ?1, updated_at = ?2,
+                    source_sequence = ?3, source_timestamp = ?4",
+                rusqlite::params![&json, updated_at, seq, ts],
             )
             .map_err(|e| format!("save snapshot: {e}"))?;
             Ok(())
@@ -60,21 +115,42 @@ impl SqliteStateStore {
         .map_err(|e| format!("spawn_blocking: {e}"))?
     }
 
-    /// Load the most recent correlation snapshot from the database.
+    /// Load the most recent correlation snapshot and source position from the database.
     /// Returns `None` if no snapshot has been saved yet.
-    pub async fn load(&self) -> Result<Option<CorrelationSnapshot>, String> {
+    pub async fn load(
+        &self,
+    ) -> Result<Option<(CorrelationSnapshot, Option<SourcePosition>)>, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().map_err(|_| "state store lock poisoned")?;
             let mut stmt = c
-                .prepare("SELECT snapshot FROM rsigma_correlation_state WHERE id = 1")
+                .prepare(
+                    "SELECT snapshot, source_sequence, source_timestamp
+                     FROM rsigma_correlation_state WHERE id = 1",
+                )
                 .map_err(|e| format!("prepare load: {e}"))?;
             let mut rows = stmt.query([]).map_err(|e| format!("query: {e}"))?;
             if let Some(row) = rows.next().map_err(|e| format!("next: {e}"))? {
-                let json: String = row.get(0).map_err(|e| format!("get: {e}"))?;
+                let json: String = row.get(0).map_err(|e| format!("get snapshot: {e}"))?;
                 let snapshot: CorrelationSnapshot = serde_json::from_str(&json)
                     .map_err(|e| format!("deserialize snapshot: {e}"))?;
-                Ok(Some(snapshot))
+
+                let seq: Option<i64> = row
+                    .get(1)
+                    .map_err(|e| format!("get source_sequence: {e}"))?;
+                let ts: Option<i64> = row
+                    .get(2)
+                    .map_err(|e| format!("get source_timestamp: {e}"))?;
+
+                let position = match (seq, ts) {
+                    (Some(s), Some(t)) => Some(SourcePosition {
+                        sequence: s as u64,
+                        timestamp: t,
+                    }),
+                    _ => None,
+                };
+
+                Ok(Some((snapshot, position)))
             } else {
                 Ok(None)
             }
