@@ -40,10 +40,10 @@ impl DaemonProcess {
 
         for line in reader.lines() {
             let line = line.unwrap();
-            if line.contains("API server listening") {
-                if let Some(addr) = extract_addr(&line) {
-                    api_addr = addr;
-                }
+            if line.contains("API server listening")
+                && let Some(addr) = extract_addr(&line)
+            {
+                api_addr = addr;
             }
             if line.contains("Sink started") {
                 break;
