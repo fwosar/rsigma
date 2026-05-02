@@ -927,19 +927,21 @@ async fn ingest_events(State(state): State<AppState>, body: String) -> Response 
         .into_response()
 }
 
-/// Accept OTLP logs via HTTP POST (protobuf encoding).
+/// Accept OTLP logs via HTTP POST (protobuf or JSON encoding).
 ///
 /// Decodes `ExportLogsServiceRequest` from the request body, flattens each
 /// `LogRecord` into a JSON `RawEvent`, and forwards it to the engine pipeline.
 /// Always mounted on `/v1/logs` when the `daemon-otlp` feature is compiled in.
+///
+/// Per the OTLP/HTTP spec, both `application/x-protobuf` and
+/// `application/json` content types are supported. When no Content-Type is
+/// provided, protobuf is assumed (spec default).
 #[cfg(feature = "daemon-otlp")]
 async fn otlp_http_logs(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    use prost::Message;
-
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -948,6 +950,7 @@ async fn otlp_http_logs(
     let request = if content_type.starts_with("application/x-protobuf")
         || content_type.starts_with("application/protobuf")
     {
+        use prost::Message;
         match rsigma_runtime::ExportLogsServiceRequest::decode(body) {
             Ok(req) => req,
             Err(e) => {
@@ -960,11 +963,27 @@ async fn otlp_http_logs(
                     .into_response();
             }
         }
+    } else if content_type.starts_with("application/json") {
+        match serde_json::from_slice::<rsigma_runtime::ExportLogsServiceRequest>(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("JSON decode error: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
     } else {
         return (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Json(serde_json::json!({
-                "error": format!("unsupported content-type: {content_type} (expected application/x-protobuf)")
+                "error": format!(
+                    "unsupported content-type: {content_type} \
+                     (expected application/x-protobuf or application/json)"
+                )
             })),
         )
             .into_response();
@@ -984,8 +1003,6 @@ async fn otlp_http_logs(
         }
     }
 
-    // OTLP spec: return empty ExportLogsServiceResponse as protobuf or JSON
-    // based on the request content-type. For simplicity, always return JSON.
     (
         StatusCode::OK,
         Json(serde_json::json!({
