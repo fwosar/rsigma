@@ -230,7 +230,10 @@ pub async fn run_daemon(config: DaemonConfig) {
     let tonic_router = {
         let grpc_service = rsigma_runtime::LogsServiceServer::new(OtlpLogsGrpcService {
             event_tx: event_tx.clone(),
-        });
+            metrics: metrics.clone(),
+        })
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip);
         let routes = tonic::service::Routes::from(app).add_service(grpc_service);
         let mut server = tonic::transport::Server::builder();
         server.add_routes(routes)
@@ -957,7 +960,8 @@ async fn ingest_events(State(state): State<AppState>, body: String) -> Response 
 ///
 /// Per the OTLP/HTTP spec, both `application/x-protobuf` and
 /// `application/json` content types are supported. When no Content-Type is
-/// provided, protobuf is assumed (spec default).
+/// provided, protobuf is assumed (spec default). Gzip content encoding is
+/// supported and transparently decompressed.
 #[cfg(feature = "daemon-otlp")]
 async fn otlp_http_logs(
     State(state): State<AppState>,
@@ -969,36 +973,17 @@ async fn otlp_http_logs(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/x-protobuf");
 
-    let request = if content_type.starts_with("application/x-protobuf")
-        || content_type.starts_with("application/protobuf")
-    {
-        use prost::Message;
-        match rsigma_runtime::ExportLogsServiceRequest::decode(body) {
-            Ok(req) => req,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("protobuf decode error: {e}")
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    } else if content_type.starts_with("application/json") {
-        match serde_json::from_slice::<rsigma_runtime::ExportLogsServiceRequest>(&body) {
-            Ok(req) => req,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("JSON decode error: {e}")
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    } else {
+    let is_proto = content_type.starts_with("application/x-protobuf")
+        || content_type.starts_with("application/protobuf");
+    let is_json = content_type.starts_with("application/json");
+    let encoding = if is_proto { "protobuf" } else { "json" };
+
+    if !is_proto && !is_json {
+        state
+            .metrics
+            .otlp_errors
+            .with_label_values(&["http", "unsupported_content_type"])
+            .inc();
         return (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Json(serde_json::json!({
@@ -1009,12 +994,84 @@ async fn otlp_http_logs(
             })),
         )
             .into_response();
+    }
+
+    let body = match otlp_maybe_decompress(&headers, body) {
+        Ok(b) => b,
+        Err(e) => {
+            state
+                .metrics
+                .otlp_errors
+                .with_label_values(&["http", "decompression"])
+                .inc();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("decompression error: {e}")
+                })),
+            )
+                .into_response();
+        }
     };
 
+    let request = if is_proto {
+        use prost::Message;
+        match rsigma_runtime::ExportLogsServiceRequest::decode(body) {
+            Ok(req) => req,
+            Err(e) => {
+                state
+                    .metrics
+                    .otlp_errors
+                    .with_label_values(&["http", "decode"])
+                    .inc();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("protobuf decode error: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match serde_json::from_slice::<rsigma_runtime::ExportLogsServiceRequest>(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                state
+                    .metrics
+                    .otlp_errors
+                    .with_label_values(&["http", "decode"])
+                    .inc();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("JSON decode error: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    state
+        .metrics
+        .otlp_requests
+        .with_label_values(&["http", encoding])
+        .inc();
+
     let raw_events = rsigma_runtime::logs_request_to_raw_events(&request);
+    state
+        .metrics
+        .otlp_log_records
+        .inc_by(raw_events.len() as u64);
 
     for event in raw_events {
         if state.otlp_event_tx.send(event).await.is_err() {
+            state
+                .metrics
+                .otlp_errors
+                .with_label_values(&["http", "channel_closed"])
+                .inc();
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -1038,8 +1095,30 @@ async fn otlp_http_logs(
 }
 
 #[cfg(feature = "daemon-otlp")]
+fn otlp_maybe_decompress(
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::body::Bytes, std::io::Error> {
+    let content_encoding = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_encoding == "gzip" {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        Ok(axum::body::Bytes::from(decompressed))
+    } else {
+        Ok(body)
+    }
+}
+
+#[cfg(feature = "daemon-otlp")]
 struct OtlpLogsGrpcService {
     event_tx: mpsc::Sender<RawEvent>,
+    metrics: Arc<Metrics>,
 }
 
 #[cfg(feature = "daemon-otlp")]
@@ -1049,13 +1128,24 @@ impl rsigma_runtime::LogsService for OtlpLogsGrpcService {
         &self,
         request: tonic::Request<rsigma_runtime::ExportLogsServiceRequest>,
     ) -> Result<tonic::Response<rsigma_runtime::ExportLogsServiceResponse>, tonic::Status> {
+        self.metrics
+            .otlp_requests
+            .with_label_values(&["grpc", "protobuf"])
+            .inc();
+
         let raw_events = rsigma_runtime::logs_request_to_raw_events(&request.into_inner());
+        self.metrics
+            .otlp_log_records
+            .inc_by(raw_events.len() as u64);
 
         for event in raw_events {
-            self.event_tx
-                .send(event)
-                .await
-                .map_err(|_| tonic::Status::unavailable("event channel closed"))?;
+            self.event_tx.send(event).await.map_err(|_| {
+                self.metrics
+                    .otlp_errors
+                    .with_label_values(&["grpc", "channel_closed"])
+                    .inc();
+                tonic::Status::unavailable("event channel closed")
+            })?;
         }
 
         Ok(tonic::Response::new(
