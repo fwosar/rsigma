@@ -226,13 +226,30 @@ pub async fn run_daemon(config: DaemonConfig) {
 
     let app = app.with_state(app_state);
 
+    #[cfg(feature = "daemon-otlp")]
+    let tonic_router = {
+        let grpc_service = rsigma_runtime::LogsServiceServer::new(OtlpLogsGrpcService {
+            event_tx: event_tx.clone(),
+        });
+        let routes = tonic::service::Routes::from(app).add_service(grpc_service);
+        let mut server = tonic::transport::Server::builder();
+        server.add_routes(routes)
+    };
+
+    #[cfg(not(feature = "daemon-otlp"))]
     let listener = tokio::net::TcpListener::bind(config.api_addr)
         .await
         .unwrap_or_else(|e| {
             tracing::error!(addr = %config.api_addr, error = %e, "Failed to bind API server");
             std::process::exit(1);
         });
+
+    #[cfg(not(feature = "daemon-otlp"))]
     let actual_addr = listener.local_addr().unwrap_or(config.api_addr);
+
+    #[cfg(feature = "daemon-otlp")]
+    tracing::info!(addr = %config.api_addr, "API server listening (HTTP/2 + gRPC)");
+    #[cfg(not(feature = "daemon-otlp"))]
     tracing::info!(addr = %actual_addr, "API server listening");
 
     // Spawn SIGHUP listener
@@ -554,10 +571,15 @@ pub async fn run_daemon(config: DaemonConfig) {
 
     let drain_duration = std::time::Duration::from_secs(config.drain_timeout);
 
+    #[cfg(feature = "daemon-otlp")]
+    let serve_future = tonic_router.serve_with_shutdown(config.api_addr, shutdown_signal());
+    #[cfg(not(feature = "daemon-otlp"))]
+    let serve_future = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
     let shutdown_triggered = tokio::select! {
-        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+        result = serve_future => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "HTTP server error");
+                tracing::error!(error = %e, "server error");
             }
             true
         }
@@ -1013,6 +1035,33 @@ async fn otlp_http_logs(
         })),
     )
         .into_response()
+}
+
+#[cfg(feature = "daemon-otlp")]
+struct OtlpLogsGrpcService {
+    event_tx: mpsc::Sender<RawEvent>,
+}
+
+#[cfg(feature = "daemon-otlp")]
+#[tonic::async_trait]
+impl rsigma_runtime::LogsService for OtlpLogsGrpcService {
+    async fn export(
+        &self,
+        request: tonic::Request<rsigma_runtime::ExportLogsServiceRequest>,
+    ) -> Result<tonic::Response<rsigma_runtime::ExportLogsServiceResponse>, tonic::Status> {
+        let raw_events = rsigma_runtime::logs_request_to_raw_events(&request.into_inner());
+
+        for event in raw_events {
+            self.event_tx
+                .send(event)
+                .await
+                .map_err(|_| tonic::Status::unavailable("event channel closed"))?;
+        }
+
+        Ok(tonic::Response::new(
+            rsigma_runtime::ExportLogsServiceResponse::default(),
+        ))
+    }
 }
 
 #[cfg(test)]

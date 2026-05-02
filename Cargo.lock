@@ -3549,6 +3549,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "ureq",

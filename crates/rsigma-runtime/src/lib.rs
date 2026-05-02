@@ -66,5 +66,6 @@ pub use io::{NatsConnectConfig, NatsSink, NatsSource, ReplayPolicy};
 
 #[cfg(feature = "otlp")]
 pub use io::otlp::{
-    ExportLogsServiceRequest, ExportLogsServiceResponse, logs_request_to_raw_events,
+    ExportLogsServiceRequest, ExportLogsServiceResponse, LogsService, LogsServiceServer,
+    logs_request_to_raw_events,
 };
