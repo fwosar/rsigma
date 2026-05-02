@@ -328,7 +328,8 @@ pub async fn run_daemon(config: DaemonConfig) {
     let (ack_tx, mut ack_rx) = mpsc::channel::<AckToken>(buffer_size);
 
     // Select source based on --input flag
-    let source_handle: Option<tokio::task::JoinHandle<()>> = match config.input.as_str() {
+    #[cfg_attr(not(feature = "daemon-otlp"), allow(unused_mut))]
+    let mut source_handle: Option<tokio::task::JoinHandle<()>> = match config.input.as_str() {
         "stdin" | "stdin://" => {
             let h = spawn_source(
                 StdinSource::new(),
@@ -390,6 +391,20 @@ pub async fn run_daemon(config: DaemonConfig) {
         None
     };
 
+    // When a finite source (stdin/NATS) completes but OTLP handlers still hold
+    // event_tx clones, event_rx.recv() would block forever. This notify signals
+    // the engine to close its receiver so it drains remaining events and exits.
+    #[cfg(feature = "daemon-otlp")]
+    let source_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    #[cfg(feature = "daemon-otlp")]
+    if let Some(h) = source_handle.take() {
+        let done = source_done_notify.clone();
+        tokio::spawn(async move {
+            let _ = h.await;
+            done.notify_one();
+        });
+    }
+
     // Engine task: reads RawEvents, evaluates rules, sends results + ack tokens
     // to the sink channel. Events with no detections are acked immediately.
     // Parse errors are routed to the DLQ.
@@ -401,14 +416,47 @@ pub async fn run_daemon(config: DaemonConfig) {
     let engine_ack_tx = ack_tx.clone();
     let engine_dlq_tx = dlq_tx.clone();
     let dlq_enabled = config.dlq.is_some();
-    let mut engine_handle = tokio::spawn(async move {
+    #[cfg(feature = "daemon-otlp")]
+    let engine_source_done = source_done_notify;
+    let engine_handle = tokio::spawn(async move {
         let filter_fn = move |v: &serde_json::Value| crate::apply_event_filter(v, &event_filter);
+        #[cfg(feature = "daemon-otlp")]
+        let source_done = engine_source_done;
+        #[cfg(feature = "daemon-otlp")]
+        let mut source_finished = false;
         loop {
             let pipeline_start = std::time::Instant::now();
 
-            let first = match event_rx.recv().await {
-                Some(raw_event) => raw_event,
-                None => break,
+            let first = {
+                #[cfg(feature = "daemon-otlp")]
+                {
+                    if source_finished {
+                        match event_rx.recv().await {
+                            Some(e) => e,
+                            None => break,
+                        }
+                    } else {
+                        tokio::select! {
+                            event = event_rx.recv() => match event {
+                                Some(e) => e,
+                                None => break,
+                            },
+                            _ = source_done.notified() => {
+                                source_finished = true;
+                                event_rx.close();
+                                match event_rx.recv().await {
+                                    Some(e) => e,
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "daemon-otlp"))]
+                match event_rx.recv().await {
+                    Some(raw_event) => raw_event,
+                    None => break,
+                }
             };
             engine_metrics.on_input_queue_depth_change(-1);
 
@@ -570,24 +618,39 @@ pub async fn run_daemon(config: DaemonConfig) {
     let drain_duration = std::time::Duration::from_secs(config.drain_timeout);
 
     #[cfg(feature = "daemon-otlp")]
-    let serve_future = {
+    let mut serve_handle = {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        tonic::transport::Server::builder()
-            .accept_http1(true)
-            .serve_with_incoming_shutdown(otlp_routes, incoming, shutdown_signal())
-    };
-    #[cfg(not(feature = "daemon-otlp"))]
-    let serve_future = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-
-    let shutdown_triggered = tokio::select! {
-        result = serve_future => {
-            if let Err(e) = result {
+        tokio::spawn(async move {
+            if let Err(e) = tonic::transport::Server::builder()
+                .accept_http1(true)
+                .serve_with_incoming_shutdown(otlp_routes, incoming, async {
+                    tokio::signal::ctrl_c().await.ok();
+                    tracing::info!("Shutdown signal received");
+                })
+                .await
+            {
                 tracing::error!(error = %e, "server error");
             }
-            true
+        })
+    };
+    #[cfg(not(feature = "daemon-otlp"))]
+    let mut serve_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                tokio::signal::ctrl_c().await.ok();
+                tracing::info!("Shutdown signal received");
+            })
+            .await
+        {
+            tracing::error!(error = %e, "server error");
         }
-        _ = &mut engine_handle => {
+    });
+
+    let shutdown_triggered = tokio::select! {
+        _ = &mut serve_handle => true,
+        _ = engine_handle => {
             tracing::info!("Streaming pipeline complete");
+            serve_handle.abort();
             false
         }
     };
@@ -600,7 +663,6 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
 
         let drain = async {
-            let _ = engine_handle.await;
             let _ = sink_handle.await;
             let _ = dlq_handle.await;
             let _ = ack_handle.await;
@@ -684,13 +746,6 @@ async fn build_sink(
         "Unsupported output sink (supported: stdout, file://<path>, nats://)"
     );
     std::process::exit(1);
-}
-
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
-    tracing::info!("Shutdown signal received");
 }
 
 /// Parse a nats:// URL into (server_url, subject).
